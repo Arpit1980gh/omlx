@@ -33,6 +33,8 @@ try:
     from mlx.utils import tree_flatten, tree_unflatten
     from mlx_lm.models.base import create_attention_mask
 
+    from omlx.patches.mlx_vlm_minimax_m3_compat import virtual_nvfp4 as minimax_nvfp4
+
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
@@ -446,7 +448,10 @@ def _configure_minimax_shared_expert_layout(config: dict, oq_level: float) -> bo
     """
     if not _is_minimax_m3_config(config):
         return False
-    if int(_LEVEL_BITS.get(oq_level, oq_level)) >= 8:
+    # NVFP4 routed experts can never share a bank with the MXFP8 shared expert.
+    if int(
+        _LEVEL_BITS.get(oq_level, oq_level)
+    ) >= 8 and not minimax_nvfp4.has_nvfp4_routed_experts(config):
         return False
     text_config = config.get("text_config")
     if not isinstance(text_config, dict):
@@ -4881,6 +4886,11 @@ class _VirtualTensor(NamedTuple):
     dtype: str
     materialize: Callable
     hides: tuple
+    # Optional packed source form: ``load_packed()`` returns (weight, scales)
+    # in the mlx format that ``quant_info`` describes, so the quantizer can
+    # pass the source through instead of re-quantizing the materialized value.
+    quant_info: dict | None = None
+    load_packed: Callable | None = None
 
 
 class _LazyTensorIndex:
@@ -4965,7 +4975,17 @@ class _LazyTensorIndex:
 
         register_virtual_tensors(self, config)
 
-    def register_virtual(self, key, shape, dtype, materializer, *, hides=()):
+    def register_virtual(
+        self,
+        key,
+        shape,
+        dtype,
+        materializer,
+        *,
+        hides=(),
+        quant_info=None,
+        load_packed=None,
+    ):
         """Declare ``key`` as produced on demand by ``materializer``.
 
         ``shape``/``dtype`` describe the logical tensor as sanitize and the
@@ -4973,11 +4993,18 @@ class _LazyTensorIndex:
         ``"BF16"``). ``hides`` lists the on-disk keys it is derived from; they
         stay readable via :meth:`load_source` but disappear from the logical
         view so sanitize never sees the pre-restructure layout.
+
+        ``quant_info`` and ``load_packed`` describe an optional packed form
+        that can be passed through like a native mxfp4/mxfp8 source pair.
         """
+        if (quant_info is None) != (load_packed is None):
+            raise ValueError("quant_info and load_packed must be given together")
         self._virtual[key] = _VirtualTensor(
-            tuple(shape), dtype, materializer, tuple(hides)
+            tuple(shape), dtype, materializer, tuple(hides), quant_info, load_packed
         )
         self._hidden.update(hides)
+        if quant_info is not None:
+            self._src_quant[key] = dict(quant_info)
 
     def materialize_virtual(self, key):
         """Produce a virtual tensor's value."""
@@ -4993,6 +5020,8 @@ class _LazyTensorIndex:
         entry = self._virtual.pop(key, None)
         if entry is None:
             return
+        if entry.quant_info is not None:
+            self._src_quant.pop(key, None)
         still_hidden = set()
         for other in self._virtual.values():
             still_hidden.update(other.hides)
@@ -5200,6 +5229,9 @@ class _LazyTensorIndex:
         source_quant_info. fp8_block scales are expanded from per-block to
         per-32-column-group, mirroring the model sanitize's repeat expansion.
         """
+        virtual = self._virtual.get(wk)
+        if virtual is not None and virtual.load_packed is not None:
+            return virtual.load_packed()
         sk = self._fp8_pairs[wk]
         info = self._src_quant[wk]
         weight_raw = self._load_raw(wk)
@@ -7288,6 +7320,16 @@ def quantize_oq_streaming(
                     {"processed_bytes": processed_bytes, "total_bytes": total_bytes},
                 )
 
+    minimax_nvfp4_experts = _is_minimax_m3_config(
+        config
+    ) and minimax_nvfp4.has_nvfp4_routed_experts(config)
+    if minimax_nvfp4_experts:
+        out_shard_data.update(
+            minimax_nvfp4.routed_expert_scale_tensors(
+                getattr(all_weights, "_lazy", all_weights), config, per_layer_config
+            )
+        )
+
     del all_weights
     mx.synchronize()
     mx.clear_cache()
@@ -7392,6 +7434,11 @@ def quantize_oq_streaming(
         quant_info[key] = val
     output_config["quantization"] = quant_info
     output_config["quantization_config"] = quant_info
+    if minimax_nvfp4_experts:
+        output_config["text_config"] = {
+            **output_config["text_config"],
+            "routed_expert_scales": True,
+        }
     _apply_output_dtype(output_config, dtype)
     with open(output / "config.json", "w") as f:
         json.dump(output_config, f, indent=2, ensure_ascii=False)
