@@ -319,6 +319,26 @@ def _swiglu_oai(
     return (x_glu * mx.sigmoid(alpha * x_glu) * (x_linear + beta)).astype(dtype)
 
 
+@partial(mx.compile, shapeless=True)
+def _scaled_swiglu_oai(
+    x_linear,
+    x_glu,
+    linear_scale,
+    glu_scale,
+    alpha: float = 1.702,
+    limit: float = 7.0,
+    beta: float = 1.0,
+):
+    # The scales restore real projection outputs before the clip, so the math
+    # runs in float32 and only the activation is rounded to the input dtype.
+    dtype = x_linear.dtype
+    x_glu = mx.clip(x_glu.astype(mx.float32) * glu_scale, a_min=None, a_max=limit)
+    x_linear = mx.clip(
+        x_linear.astype(mx.float32) * linear_scale, a_min=-limit, a_max=limit
+    )
+    return (x_glu * mx.sigmoid(alpha * x_glu) * (x_linear + beta)).astype(dtype)
+
+
 class MiniMaxSwiGLUOAI(nn.Module):
     def __init__(
         self,
@@ -762,6 +782,59 @@ class MiniMaxPackedSwitchGLU(nn.Module):
         return x.squeeze(-2)
 
 
+class MiniMaxScaledSwitchGLU(SwitchGLU):
+    """SwitchGLU for NVFP4 experts that carry a per-expert global scale.
+
+    gate_scale and up_scale are applied inside the activation. down_scale is
+    returned to the caller through the routing weights, so the down output
+    stays at its raw NVFP4 magnitude here.
+    """
+
+    def __init__(
+        self,
+        input_dims: int,
+        hidden_dims: int,
+        num_experts: int,
+        activation: MiniMaxSwiGLUOAI,
+    ):
+        super().__init__(input_dims, hidden_dims, num_experts, activation=activation)
+        self.gate_scale = mx.ones((num_experts,), dtype=mx.float32)
+        self.up_scale = mx.ones((num_experts,), dtype=mx.float32)
+        self.down_scale = mx.ones((num_experts,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        x = mx.expand_dims(x, (-2, -3))
+
+        indices = mx.stop_gradient(indices)
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _switch_gather_sort(x, indices)
+
+        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        act = self.activation
+        x = self.down_proj(
+            _scaled_swiglu_oai(
+                x_up,
+                x_gate,
+                self.up_scale[idx][..., None, None],
+                self.gate_scale[idx][..., None, None],
+                act.alpha,
+                act.limit,
+                act.beta,
+            ),
+            idx,
+            sorted_indices=do_sort,
+        )
+
+        if do_sort:
+            x = _switch_scatter_unsort(x, inv_order, indices.shape)
+
+        return x.squeeze(-2)
+
+
 class MiniMaxAttention(nn.Module):
     def __init__(self, args: TextConfig, layer_idx: int):
         super().__init__()
@@ -1143,11 +1216,23 @@ class MiniMaxSparseMoeBlock(nn.Module):
             args.swiglu_limit,
             args.swiglu_beta,
         )
+        self.routed_expert_scales = bool(getattr(args, "routed_expert_scales", False))
+        if self.routed_expert_scales and self.pack_shared_expert:
+            raise ValueError(
+                "MiniMax routed expert scales require pack_shared_expert=False."
+            )
         if self.pack_shared_expert:
             self.switch_mlp = MiniMaxPackedSwitchGLU(
                 args.hidden_size,
                 args.intermediate_size,
                 args.num_local_experts + 1,
+                activation=activation,
+            )
+        elif self.routed_expert_scales:
+            self.switch_mlp = MiniMaxScaledSwitchGLU(
+                args.hidden_size,
+                args.intermediate_size,
+                args.num_local_experts,
                 activation=activation,
             )
         else:
@@ -1187,6 +1272,10 @@ class MiniMaxSparseMoeBlock(nn.Module):
                 self.routed_scaling_factor,
                 self.scoring_func,
             )
+            if self.routed_expert_scales:
+                # The down projection output is still scaled by the expert's
+                # NVFP4 global scale. Fold its inverse into the routing weight.
+                scores = scores * self.switch_mlp.down_scale[inds]
         else:
             if self.scoring_func == "sigmoid":
                 scores = mx.sigmoid(gates)
@@ -1198,6 +1287,8 @@ class MiniMaxSparseMoeBlock(nn.Module):
             scores = mx.take_along_axis(scores, inds, axis=-1)
             scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
             scores = scores * self.routed_scaling_factor
+            if self.routed_expert_scales:
+                scores = scores * self.switch_mlp.down_scale[inds]
         if self.pack_shared_expert:
             shared_inds = mx.full(
                 (*inds.shape[:-1], 1), self.shared_expert_index, dtype=inds.dtype
@@ -1594,8 +1685,16 @@ class LanguageModel(nn.Module):
     @property
     def cast_predicate(self):
         def predicate(k):
-            keep_fp32 = "e_score_correction_bias" in k or k.endswith(
-                "block_sparse_moe.gate.weight"
+            keep_fp32 = (
+                "e_score_correction_bias" in k
+                or k.endswith("block_sparse_moe.gate.weight")
+                or k.endswith(
+                    (
+                        "switch_mlp.gate_scale",
+                        "switch_mlp.up_scale",
+                        "switch_mlp.down_scale",
+                    )
+                )
             )
             return not keep_fp32
 

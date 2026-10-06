@@ -16,6 +16,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from .virtual_nvfp4 import has_nvfp4_routed_experts
+
 logger = logging.getLogger(__name__)
 
 _VENDOR_MLX_VLM = Path(__file__).resolve().parent / "vendor" / "mlx_vlm"
@@ -24,6 +26,8 @@ _MINIMAX_ARCHITECTURES = {
     "MiniMaxM3ForCausalLM",
     "MiniMaxM3SparseForCausalLM",
 }
+
+_NVFP4_QUANTIZATION = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 
 _APPLIED = False
 _IGNORED_LAYER_STACK: list[tuple[str, ...]] = []
@@ -288,11 +292,24 @@ def _normalize_quantization_config(config: dict[str, Any]) -> None:
     if quant_method != "mxfp8" or "quantization" in config:
         return
 
-    config["quantization"] = {
-        "group_size": int(quantization_config.get("group_size") or 32),
-        "bits": int(quantization_config.get("bits") or 8),
-        "mode": "mxfp8",
-    }
+    # MLX mxfp8 only supports group size 32. M3.1 reports group_size 16 at the
+    # top level, which describes its NVFP4 routed experts instead.
+    quantization: dict[str, Any] = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    text_config = config.get("text_config")
+    if has_nvfp4_routed_experts(config) and isinstance(text_config, dict):
+        # NVFP4 experts cannot share a stacked bank with the MXFP8 shared expert.
+        text_config["pack_shared_expert"] = False
+        text_config["routed_expert_scales"] = True
+        args = importlib.import_module(
+            "mlx_vlm.models.minimax_m3_vl.config"
+        ).TextConfig.from_dict(text_config)
+        for layer_idx in range(args.num_hidden_layers):
+            if not args.is_moe_layer(layer_idx):
+                continue
+            prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                quantization[f"{prefix}.switch_mlp.{proj}"] = dict(_NVFP4_QUANTIZATION)
+    config["quantization"] = quantization
 
 
 def _quantization_ignored_layers(config: Any) -> tuple[str, ...]:

@@ -179,6 +179,46 @@ def test_minimax_quantization_compat_restores_mxfp8_and_skip_module(tmp_path):
     assert skip_multimodal_module("patch_merge_mlp.layers.0")
 
 
+def test_minimax_nvfp4_experts_get_per_layer_quantization(tmp_path):
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    from mlx_vlm.utils import load_config
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "minimax_m3_vl",
+                "text_config": {"num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+                "quantization_config": {
+                    "quant_method": "mxfp8",
+                    "group_size": 16,
+                    "moe_quant_algo": "NVFP4",
+                    "moe_quant_format": "nvfp4-pack-quantized",
+                },
+            }
+        )
+    )
+
+    config = load_config(tmp_path)
+
+    nvfp4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    prefix = "language_model.model.layers.1.block_sparse_moe.switch_mlp"
+    assert config["quantization"] == {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "mxfp8",
+        f"{prefix}.gate_proj": nvfp4,
+        f"{prefix}.up_proj": nvfp4,
+        f"{prefix}.down_proj": nvfp4,
+    }
+    assert config["text_config"]["pack_shared_expert"] is False
+    assert config["text_config"]["routed_expert_scales"] is True
+
+
 def test_ignored_layer_matching_covers_children():
     from omlx.patches.mlx_vlm_minimax_m3_compat import (
         _is_ignored_layer,
@@ -189,10 +229,10 @@ def test_ignored_layer_matching_covers_children():
     assert not _is_ignored_layer("language_model.block", ("vision_tower",))
 
 
-def _tiny_text_config(*, pack_shared_expert):
+def _tiny_text_config(*, pack_shared_expert, **overrides):
     from mlx_vlm.models.minimax_m3_vl.config import TextConfig
 
-    return TextConfig(
+    params = dict(
         hidden_size=64,
         intermediate_size=32,
         shared_intermediate_size=32,
@@ -208,6 +248,112 @@ def _tiny_text_config(*, pack_shared_expert):
         use_routing_bias=False,
         pack_shared_expert=pack_shared_expert,
     )
+    params.update(overrides)
+    return TextConfig(**params)
+
+
+def test_minimax_nvfp4_experts_match_dequantized_reference():
+    mx = pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    from mlx.utils import tree_flatten
+
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    from mlx_vlm.models.minimax_m3_vl.language import (
+        MiniMaxSparseMoeBlock,
+        _swiglu_oai,
+    )
+    from mlx_vlm.models.minimax_m3_vl.minimax_m3_vl import _sanitize_moe_weights
+
+    mx.random.seed(0)
+    args = _tiny_text_config(
+        pack_shared_expert=False,
+        routed_expert_scales=True,
+        use_routing_bias=True,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+    )
+    prefix = "language_model.model.layers.0.block_sparse_moe"
+    shapes = {"w1": (32, 64), "w2": (64, 32), "w3": (32, 64)}
+
+    # Store each expert the way compressed-tensors does: FP4 codes of
+    # w * G plus E4M3 block scales, with the real weight being dequant / G.
+    weights, real = {}, {}
+    for expert in range(args.num_local_experts):
+        for name, shape in shapes.items():
+            w = mx.random.normal(shape) * 0.05
+            global_scale = 2688.0 / mx.abs(w).max()
+            wq, scales = mx.quantize(
+                w * global_scale, group_size=16, bits=4, mode="nvfp4"
+            )
+            base = f"{prefix}.experts.{expert}.{name}"
+            weights[f"{base}.weight_packed"] = wq.view(mx.uint8)
+            weights[f"{base}.weight_scale"] = scales
+            weights[f"{base}.weight_global_scale"] = global_scale.reshape(())
+            weights[f"{base}.input_global_scale"] = mx.array(1.0)
+            real[(expert, name)] = (
+                mx.dequantize(wq, scales, group_size=16, bits=4, mode="nvfp4")
+                / global_scale
+            )
+    shared = {
+        "gate_proj": mx.random.normal((32, 64)) * 0.05,
+        "up_proj": mx.random.normal((32, 64)) * 0.05,
+        "down_proj": mx.random.normal((64, 32)) * 0.05,
+    }
+    for name, w in shared.items():
+        weights[f"{prefix}.shared_experts.{name}.weight"] = w
+    router = mx.random.normal((args.num_local_experts, 64))
+    bias = mx.random.normal((args.num_local_experts,)) * 0.1
+    weights[f"{prefix}.gate.weight"] = router
+    weights[f"{prefix}.e_score_correction_bias"] = bias
+
+    _sanitize_moe_weights(weights, args)
+    assert f"{prefix}.experts.0.w1.weight_packed" not in weights
+    assert weights[f"{prefix}.switch_mlp.down_scale"].dtype == mx.float32
+
+    block = MiniMaxSparseMoeBlock(args)
+    nvfp4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    nn.quantize(
+        block,
+        class_predicate=lambda path, m: (
+            nvfp4
+            if path.startswith("switch_mlp.") and hasattr(m, "to_quantized")
+            else False
+        ),
+    )
+    block.load_weights(
+        [(k[len(prefix) + 1 :], v) for k, v in weights.items()], strict=True
+    )
+    assert {k for k, _ in tree_flatten(block.parameters())} >= {
+        "switch_mlp.gate_scale",
+        "switch_mlp.up_scale",
+        "switch_mlp.down_scale",
+    }
+
+    x = mx.random.normal((1, 3, 64))
+    output = block(x.astype(mx.bfloat16)).astype(mx.float32)
+
+    # Float32 reference with the exact dequantized weights.
+    scores = mx.sigmoid(x @ router.T)
+    inds = mx.argpartition(-(scores + bias), kth=1, axis=-1)[..., :2]
+    weights_k = mx.take_along_axis(scores, inds, axis=-1)
+    weights_k = weights_k / weights_k.sum(-1, keepdims=True) * 2.0
+    expected = x @ shared["up_proj"].T
+    expected = _swiglu_oai(expected, x @ shared["gate_proj"].T) @ shared["down_proj"].T
+    for t in range(3):
+        for slot in range(2):
+            expert = int(inds[0, t, slot].item())
+            xt = x[0, t]
+            h = _swiglu_oai(xt @ real[(expert, "w3")].T, xt @ real[(expert, "w1")].T)
+            routed = weights_k[0, t, slot] * (h @ real[(expert, "w2")].T)
+            expected[0, t] = expected[0, t] + routed
+
+    error = mx.abs(output - expected).max().item()
+    assert error < 2e-2 * max(mx.abs(expected).max().item(), 1.0)
 
 
 def test_minimax_unpack_sanitizer_keeps_shared_expert_separate():
@@ -332,3 +478,4 @@ def test_omlx_loader_respects_minimax_shared_expert_layout_override():
     assert _should_pack_minimax_m3_shared_expert(
         SimpleNamespace(**base, pack_shared_expert=True)
     )
+
