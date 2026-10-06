@@ -924,7 +924,20 @@ def maybe_apply_pre_load_patches(
     dflash_batched = dflash_batched_supported(
         model_type, "vlm" if for_vlm else "batched"
     ) and dflash_batched_requested(model_settings, model_name)
-    if _is_mtp_compatible(config, model_type) or dflash_batched:
+    minimax_dspark = None
+    if for_vlm and (
+        model_type in minimax_m3_types or text_model_type in minimax_m3_types
+    ):
+        from ..patches.minimax_m3_dspark import (
+            MiniMaxDSparkConfig,
+            bundled_dspark_path,
+            install_minimax_dspark_runtime,
+        )
+
+        minimax_dspark = bundled_dspark_path(model_name)
+        if minimax_dspark is not None:
+            install_minimax_dspark_runtime()
+    if _is_mtp_compatible(config, model_type) or dflash_batched or minimax_dspark:
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
@@ -946,7 +959,13 @@ def maybe_apply_pre_load_patches(
             # bf16 tail-ULP level.
             depth = getattr(model_settings, "mtp_adaptive_max_depth", None)
             fixed = getattr(model_settings, "mtp_fixed_depth", None)
-            if fixed:
+            if minimax_dspark is not None:
+                # The bundled DSpark draft proposes a fixed trained block.
+                block = MiniMaxDSparkConfig.from_dict(
+                    json.loads((minimax_dspark / "config.json").read_text())
+                ).block_size
+                set_mtp_depth(block, fixed=True)
+            elif fixed:
                 set_mtp_depth(int(fixed), fixed=True)
             elif (
                 model_type == "qwen3_5"
@@ -983,9 +1002,12 @@ def maybe_apply_pre_load_patches(
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
-                backend = (
-                    "embedded DSpark" if _has_dspark_heads(config) else "Lightning MTP"
-                )
+                if minimax_dspark is not None:
+                    backend = "bundled DSpark"
+                elif _has_dspark_heads(config):
+                    backend = "embedded DSpark"
+                else:
+                    backend = "Lightning MTP"
                 # DSpark is declared in config only, so only Lightning MTP is probed.
                 if backend == "Lightning MTP" and not _checkpoint_has_mtp_weights(
                     model_name
@@ -1071,7 +1093,7 @@ def maybe_apply_pre_load_patches(
                             model_name,
                         )
                 if apply_mlx_vlm_mtp_runtime_patch(model_type):
-                    if not has_mtp_weights:
+                    if not has_mtp_weights and _has_mtp_heads(config):
                         logger.info(
                             "mlx-vlm runtime MTP patch applied for %s "
                             "(config declares mtp heads but checkpoint "

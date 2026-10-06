@@ -196,6 +196,11 @@ def attach_drafter(language_model: Any, drafter: DFlashDrafter) -> None:
     language_model._omlx_mtp_chain = True
     language_model._omlx_mtp_depth = drafter.depth
     language_model._omlx_mtp_head_clone = False
+    # Targets whose batch caches cannot roll rows back separately verify
+    # each row against its own extracted cache.
+    language_model._omlx_mtp_independent_verify = bool(
+        getattr(drafter, "independent_verify", False)
+    )
 
 
 def detach_drafter(language_model: Any) -> DFlashDrafter | None:

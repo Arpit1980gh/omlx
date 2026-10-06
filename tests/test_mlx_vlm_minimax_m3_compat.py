@@ -479,3 +479,38 @@ def test_omlx_loader_respects_minimax_shared_expert_layout_override():
         SimpleNamespace(**base, pack_shared_expert=True)
     )
 
+
+def test_minimax_dspark_runtime_returns_captures_and_rolls_back():
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.minimax_m3_dspark import install_minimax_dspark_runtime
+
+    install_minimax_dspark_runtime()
+    from mlx_vlm.models.minimax_m3_vl.language import LanguageModel
+
+    args = _tiny_text_config(
+        pack_shared_expert=False,
+        num_hidden_layers=2,
+        moe_layer_freq=[0, 0],
+        vocab_size=64,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [1, 1],
+            "sparse_index_dim": 16,
+            "sparse_num_index_heads": 1,
+            "sparse_block_size": 8,
+            "sparse_topk_blocks": 2,
+        },
+    )
+    lm = LanguageModel(args)
+    cache = lm.make_cache()
+    tokens = mx.array([[1, 2, 3, 4, 5]])
+
+    out = lm(tokens, cache=cache, return_hidden=True, capture_layer_ids=[0])
+    plain = lm(tokens, cache=lm.make_cache(), capture_layer_ids=[0, 1])
+
+    assert len(out.hidden_states) == 2
+    assert mx.allclose(out.hidden_states[0], plain.hidden_states[0]).item()
+    assert mx.allclose(out.hidden_states[1], plain.hidden_states[1]).item()
+    assert lm.mtp_partial_rollback(cache, 1, 3)
+    assert cache[0].offset == 3
+    assert cache[0].index_offset == 3

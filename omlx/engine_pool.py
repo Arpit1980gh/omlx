@@ -4247,6 +4247,36 @@ class EnginePool:
                 if drafter is not None:
                     engine.set_dflash_drafter(drafter)
 
+            # MiniMax M3.1 bundles its DSpark draft in dspark/; Lightning MTP
+            # runs it through the same block-drafter verify path.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "mtp_enabled", False)
+                and entry.config_model_type in ("minimax_m3", "minimax_m3_vl")
+                and hasattr(engine, "set_dflash_drafter")
+            ):
+                from .patches.minimax_m3_dspark import (
+                    bundled_dspark_path,
+                    load_minimax_dspark_drafter,
+                )
+
+                dspark_path = bundled_dspark_path(entry.model_path)
+                if dspark_path is not None:
+                    try:
+                        drafter = await asyncio.get_running_loop().run_in_executor(
+                            get_mlx_executor(),
+                            load_minimax_dspark_drafter,
+                            dspark_path,
+                            engine.vlm_model,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"MiniMax DSpark drafter load raised for {model_id}: "
+                            f"{e} -- Lightning MTP stays off"
+                        )
+                    else:
+                        engine.set_dflash_drafter(drafter)
+
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.
             if (
