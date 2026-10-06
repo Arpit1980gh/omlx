@@ -966,6 +966,24 @@ class TestApplyChatTemplate:
         assert "enable_thinking" not in call_kwargs
         assert call_kwargs["thinking_mode"] == "enabled"
 
+    @pytest.mark.parametrize(
+        ("effort", "thinking_mode"),
+        [("max", None), ("xhigh", None), ("low", None), ("none", "disabled")],
+    )
+    def test_minimax_m3_forwards_reasoning_effort(self, effort, thinking_mode):
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<prompt>"
+        engine = _make_loaded_engine(model_type="minimax_m3_vl", tokenizer=tokenizer)
+
+        engine._apply_chat_template(
+            [{"role": "user", "content": "Hello"}],
+            chat_template_kwargs={"reasoning_effort": effort},
+        )
+
+        call_kwargs = tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["reasoning_effort"] == effort
+        assert call_kwargs.get("thinking_mode") == thinking_mode
+
     def test_fallback_when_no_template(self):
         """Tokenizer without apply_chat_template → manual concatenation."""
         tokenizer = MagicMock(spec=[])  # spec=[] prevents auto-creating attributes

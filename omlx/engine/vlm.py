@@ -223,6 +223,10 @@ def _apply_minimax_m3_thinking_mode(
         template_kwargs["thinking_mode"] = "enabled"
     elif enable_thinking is False:
         template_kwargs["thinking_mode"] = "disabled"
+    elif str(template_kwargs.get("reasoning_effort", "")).strip().lower() == "none":
+        # MiniMax renders the effort level verbatim; "none" also turns
+        # thinking off, as the reference server does.
+        template_kwargs["thinking_mode"] = "disabled"
 
 
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
