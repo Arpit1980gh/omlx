@@ -787,16 +787,6 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
-        from ..patches.minimax_m3_sparse_attention import (
-            apply_minimax_m3_sparse_attention_patch,
-        )
-
-        if apply_minimax_m3_sparse_attention_patch():
-            logger.info(
-                "MiniMax M3 sparse attention patch applied for %s",
-                model_name,
-            )
-
     if for_vlm and model_type == "unlimited-ocr":
         from ..patches.mlx_vlm_unlimited_ocr_compat import (
             apply_mlx_vlm_unlimited_ocr_compat_patch,
