@@ -299,6 +299,13 @@ def _masked_sparse_attention(
 
 
 @partial(mx.compile, shapeless=True)
+def _combine_routed(y: mx.array, weights: mx.array) -> mx.array:
+    # Routing weights stay float32 and the expert outputs sum in float32.
+    weighted = y.astype(mx.float32) * weights.astype(mx.float32)[..., None]
+    return weighted.sum(axis=-2).astype(y.dtype)
+
+
+@partial(mx.compile, shapeless=True)
 def _swiglu_oai(
     x_linear,
     x_glu,
@@ -306,9 +313,10 @@ def _swiglu_oai(
     limit: float = 7.0,
     beta: float = 1.0,
 ):
-    x_glu = mx.clip(x_glu, a_min=None, a_max=limit)
-    x_linear = mx.clip(x_linear, a_min=-limit, a_max=limit)
-    return x_glu * mx.sigmoid(alpha * x_glu) * (x_linear + beta)
+    dtype = x_linear.dtype
+    x_glu = mx.clip(x_glu.astype(mx.float32), a_min=None, a_max=limit)
+    x_linear = mx.clip(x_linear.astype(mx.float32), a_min=-limit, a_max=limit)
+    return (x_glu * mx.sigmoid(alpha * x_glu) * (x_linear + beta)).astype(dtype)
 
 
 class MiniMaxSwiGLUOAI(nn.Module):
@@ -334,9 +342,13 @@ class MiniMaxRMSNorm(nn.Module):
         self.eps = eps
         self.gemma = gemma
 
-    def __call__(self, x):
-        weight = self.weight + 1 if self.gemma else self.weight
-        return mx.fast.rms_norm(x, weight.astype(mx.float32), self.eps).astype(x.dtype)
+    def __call__(self, x, dtype=None):
+        # Form 1 + w in float32: adding 1 to a bf16 weight rounds every channel.
+        weight = self.weight.astype(mx.float32)
+        if self.gemma:
+            weight = weight + 1
+        output = mx.fast.rms_norm(x, weight, self.eps)
+        return output.astype(x.dtype if dtype is None else dtype)
 
 
 class MiniMaxM3KVCache:
@@ -997,19 +1009,24 @@ class MiniMaxAttention(nn.Module):
         keys = keys.reshape(B, L, self.num_key_value_heads, self.head_dim)
         values = values.reshape(B, L, self.num_key_value_heads, self.head_dim)
 
+        # q/k norms and RoPE run in float32 and round to the model dtype once.
         if self.use_qk_norm:
-            queries = self.q_norm(queries)
-            keys = self.k_norm(keys)
+            queries = self.q_norm(queries, dtype=mx.float32)
+            keys = self.k_norm(keys, dtype=mx.float32)
 
         if use_sparse_mask:
             idx_queries = self.index_q_proj(x)
             idx_keys = self.index_k_proj(x)
             idx_queries = idx_queries.reshape(B, L, self.index_heads, self.index_dim)
             idx_keys = idx_keys.reshape(B, L, 1, self.index_dim)
-            idx_queries = self.index_q_norm(idx_queries).transpose(0, 2, 1, 3)
-            idx_keys = self.index_k_norm(idx_keys).transpose(0, 2, 1, 3)
-            idx_queries = self.rope(idx_queries, offset=rope_offset)
-            idx_keys = self.rope(idx_keys, offset=rope_offset)
+            idx_queries = self.index_q_norm(idx_queries, dtype=mx.float32)
+            idx_keys = self.index_k_norm(idx_keys, dtype=mx.float32)
+            idx_queries = self.rope(
+                idx_queries.transpose(0, 2, 1, 3), offset=rope_offset
+            ).astype(x.dtype)
+            idx_keys = self.rope(
+                idx_keys.transpose(0, 2, 1, 3), offset=rope_offset
+            ).astype(x.dtype)
         else:
             idx_queries = None
             idx_keys = None
@@ -1018,13 +1035,10 @@ class MiniMaxAttention(nn.Module):
         keys = keys.transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
+        queries = self.rope(queries, offset=rope_offset).astype(x.dtype)
+        keys = self.rope(keys, offset=rope_offset).astype(x.dtype)
         if cache is not None:
-            queries = self.rope(queries, offset=rope_offset)
-            keys = self.rope(keys, offset=rope_offset)
             keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries, offset=rope_offset)
-            keys = self.rope(keys, offset=rope_offset)
 
         if use_sparse_mask:
             if cache is not None and hasattr(cache, "update_index_and_fetch"):
@@ -1173,7 +1187,6 @@ class MiniMaxSparseMoeBlock(nn.Module):
                 self.routed_scaling_factor,
                 self.scoring_func,
             )
-            scores = scores.astype(x.dtype)
         else:
             if self.scoring_func == "sigmoid":
                 scores = mx.sigmoid(gates)
@@ -1184,7 +1197,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
             inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
             scores = mx.take_along_axis(scores, inds, axis=-1)
             scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
-            scores = (scores * self.routed_scaling_factor).astype(x.dtype)
+            scores = scores * self.routed_scaling_factor
         if self.pack_shared_expert:
             shared_inds = mx.full(
                 (*inds.shape[:-1], 1), self.shared_expert_index, dtype=inds.dtype
@@ -1193,8 +1206,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
             inds = mx.concatenate([inds, shared_inds], axis=-1)
             scores = mx.concatenate([scores, shared_scores], axis=-1)
 
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = _combine_routed(self.switch_mlp(x, inds), scores)
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
