@@ -1121,8 +1121,14 @@ class MiniMaxAttention(nn.Module):
             )
             if idx_keys.shape[2] > self.sparse_block_size * self.sparse_topk_blocks:
                 left_padding = _row_left_padding(cache)
-                if left_padding is None and self._can_use_msa_prefill_attention(
-                    queries, keys, mask, sparse_q_positions
+                # Short calls (decode, speculative verify) stay on the compact
+                # path so a verify row computes exactly like a decode step.
+                if (
+                    left_padding is None
+                    and L > _SPARSE_COMPACT_MAX_QUERIES
+                    and self._can_use_msa_prefill_attention(
+                        queries, keys, mask, sparse_q_positions
+                    )
                 ):
                     output = self._msa_prefill_attention(
                         queries,
