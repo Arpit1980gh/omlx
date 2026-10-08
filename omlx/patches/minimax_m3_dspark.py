@@ -282,7 +282,7 @@ def wrap_minimax_dspark(model: MiniMaxDSparkDraftModel, source_path: str):
         model,
         block_size=model.config.block_size + 1,
         source_path=source_path,
-        adaptive=False,
+        adaptive=True,
     )
     # MiniMax batch caches trim every row by the same amount, so rows with
     # different acceptance verify against their own extracted caches.

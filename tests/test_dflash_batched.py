@@ -1045,3 +1045,4 @@ def test_minimax_dspark_sanitize_maps_checkpoint_layout():
     }
     assert sanitized["layers.0.self_attn.q_proj.weight"].dtype == mx.uint32
     assert sanitized["layers.0.self_attn.q_proj.weight"].shape == (4, 16)
+

@@ -960,11 +960,12 @@ def maybe_apply_pre_load_patches(
             depth = getattr(model_settings, "mtp_adaptive_max_depth", None)
             fixed = getattr(model_settings, "mtp_fixed_depth", None)
             if minimax_dspark is not None:
-                # The bundled DSpark draft proposes a fixed trained block.
+                # The bundled DSpark draft proposes its trained block; the
+                # depth controller verifies the profitable prefix of it.
                 block = MiniMaxDSparkConfig.from_dict(
                     json.loads((minimax_dspark / "config.json").read_text())
                 ).block_size
-                set_mtp_depth(block, fixed=True)
+                set_mtp_depth(int(fixed or block), fixed=bool(fixed))
             elif fixed:
                 set_mtp_depth(int(fixed), fixed=True)
             elif (
