@@ -1582,3 +1582,400 @@ def msa_sparse_decode_b1(
         output_dtypes=[q.dtype],
     )[0]
     return out
+
+
+# Block scores for decode and short verify calls. One threadgroup scores one
+# key block of one row against every index head and query of that row, so
+# each index key is read once and the [B, H, L, S] token scores never exist.
+# Each thread owns one key of the block; positions follow the row's own
+# coordinates (storage column = position + left padding). Scores are written
+# negated so an ascending argpartition picks the top blocks directly.
+_MSA_SMALL_L_BLOCK_SCORES = mx.fast.metal_kernel(
+    name="minimax_m3_msa_small_l_block_scores",
+    input_names=["q", "k", "qpos", "pad", "meta"],
+    output_names=["out"],
+    ensure_row_contiguous=False,
+    source=r"""
+        constexpr int HL = H * L;
+        uint blk = threadgroup_position_in_grid.x;
+        uint b = threadgroup_position_in_grid.y;
+        uint t = thread_index_in_threadgroup;
+        uint simd = t / 32;
+        uint lane = t % 32;
+        int total_len = meta[0];
+        int num_blocks = meta[1];
+
+        threadgroup T q_s[HL * D];
+        threadgroup float red_s[(BLOCK / 32) * HL];
+
+        for (uint i = t; i < uint(HL * D); i += BLOCK) {
+            q_s[i] = q[b * HL * D + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        int pos = int(blk) * BLOCK + int(t);
+        int col = pos + (HAS_PAD ? int(pad[b]) : 0);
+        bool stored = col < total_len;
+        int key_offset = int(b) * k_strides[0] + col * k_strides[2];
+
+        float acc[HL];
+        for (int i = 0; i < HL; ++i) {
+            acc[i] = 0.0f;
+        }
+        for (int d0 = 0; d0 < D; d0 += 32) {
+            float kc[32];
+            for (int j = 0; j < 32; ++j) {
+                kc[j] = stored ? float(k[key_offset + (d0 + j) * k_strides[3]]) : 0.0f;
+            }
+            for (int i = 0; i < HL; ++i) {
+                float s = 0.0f;
+                for (int j = 0; j < 32; ++j) {
+                    s += float(q_s[i * D + d0 + j]) * kc[j];
+                }
+                acc[i] += s;
+            }
+        }
+
+        for (int i = 0; i < HL; ++i) {
+            int l = i % L;
+            bool visible = stored && pos <= qpos[b * L + l];
+            float score = visible ? acc[i] : -INFINITY;
+            score = simd_max(score);
+            if (lane == 0) {
+                red_s[simd * HL + i] = score;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (t < uint(HL)) {
+            int i = int(t);
+            int h = i / L;
+            int l = i % L;
+            float score = -INFINITY;
+            for (int s = 0; s < BLOCK / 32; ++s) {
+                score = max(score, red_s[s * HL + i]);
+            }
+            if (score != score) {
+                score = -INFINITY;
+            }
+            int cur = qpos[b * L + l] / BLOCK;
+            int block = int(blk);
+            if (block > cur) {
+                score = -INFINITY;
+            } else if (LOCAL_BLOCKS > 0 && block >= cur - LOCAL_BLOCKS + 1) {
+                score = 1.0e29f;
+            } else if (INIT_BLOCKS > 0 && block < INIT_BLOCKS) {
+                score = 1.0e30f;
+            }
+            out[((int(b) * H + h) * L + l) * num_blocks + block] = -score;
+        }
+    """,
+)
+
+SMALL_L_BLOCK_SCORES_MAX_QUERIES = 16
+
+
+def _row_pad(left_padding: Optional[mx.array], batch: int, dummy: mx.array):
+    # Kernels read the padding only when HAS_PAD is set; without it any
+    # existing int32 array fills the slot and no zeros array is built.
+    if left_padding is None:
+        return dummy
+    return mx.contiguous(left_padding.reshape(-1)[:batch].astype(mx.int32))
+
+
+def small_l_block_scores(
+    idx_queries: mx.array,
+    idx_keys: mx.array,
+    qpos: mx.array,
+    left_padding: Optional[mx.array],
+    block_size: int,
+    init_blocks: int,
+    local_blocks: int,
+) -> Optional[mx.array]:
+    """Negated forced block scores ``[B, H_idx, L, num_blocks]``, or None.
+
+    Blocks after the query's current block score ``-inf``; the local blocks
+    score ``1e29`` and init blocks ``1e30``, matching the selection rule. The
+    result is negated, ready for an ascending ``argpartition``.
+    """
+    B, H, L, D = idx_queries.shape
+    if (
+        not mx.metal.is_available()
+        or L > SMALL_L_BLOCK_SCORES_MAX_QUERIES
+        or idx_keys.shape[1] != 1
+        or block_size % 32
+        or block_size > 1024
+        or D % 32
+        or H * L * D * idx_queries.dtype.size > 16384
+    ):
+        return None
+    total_len = idx_keys.shape[2]
+    num_blocks = (total_len + block_size - 1) // block_size
+    qpos = mx.contiguous(qpos.astype(mx.int32))
+    return _MSA_SMALL_L_BLOCK_SCORES(
+        inputs=[
+            mx.contiguous(idx_queries),
+            idx_keys,
+            qpos,
+            _row_pad(left_padding, B, qpos),
+            mx.array([total_len, num_blocks], dtype=mx.int32),
+        ],
+        template=[
+            ("T", idx_queries.dtype),
+            ("H", H),
+            ("L", L),
+            ("D", D),
+            ("BLOCK", block_size),
+            ("INIT_BLOCKS", init_blocks),
+            ("LOCAL_BLOCKS", local_blocks),
+            ("HAS_PAD", left_padding is not None),
+        ],
+        grid=(num_blocks * block_size, B, 1),
+        threadgroup=(block_size, 1, 1),
+        output_shapes=[(B, H, L, num_blocks)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+# Sparse attention for decode and short verify calls, split over the selected
+# blocks. Pass 1 runs one threadgroup per (row, KV head, query, selected
+# block): it scores the block's keys for the KV head's query heads, keeps the
+# block-local softmax max and sum, and accumulates P @ V. Pass 2 merges the
+# per-block partials with log-sum-exp. Every query row is computed the same
+# way whatever L is, so a verify row matches a one-token decode step.
+_MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
+    name="minimax_m3_msa_small_l_partials",
+    input_names=["q", "k", "v", "block_ids", "qpos", "pad", "meta", "scale", "vk"],
+    output_names=["part_o", "part_m", "part_l"],
+    ensure_row_contiguous=False,
+    source=r"""
+        uint slot = threadgroup_position_in_grid.x;
+        uint kl = threadgroup_position_in_grid.y;
+        uint b = threadgroup_position_in_grid.z;
+        uint t = thread_index_in_threadgroup;
+        uint simd = t / 32;
+        uint lane = t % 32;
+        int kv = int(kl) / L;
+        int l = int(kl) % L;
+        int total_len = meta[0];
+        float sm_scale = scale[0];
+
+        threadgroup float4 q_s[G * D / 4];
+        threadgroup float p_s[G * BLOCK];
+        threadgroup int col_s[BLOCK];
+        threadgroup float m_s[G];
+        threadgroup float l_s[G];
+
+        for (uint i = t; i < uint(G * D / 4); i += BLOCK) {
+            int h = int(i) / (D / 4);
+            int q_off = ((int(b) * H_KV * G + kv * G + h) * L + l) * D + (int(i) % (D / 4)) * 4;
+            q_s[i] = float4(
+                float(q[q_off]), float(q[q_off + 1]), float(q[q_off + 2]), float(q[q_off + 3])) * sm_scale;
+        }
+
+        int row = (int(b) * H_KV + kv) * L + l;
+        int blk = block_ids[row * TOPK + int(slot)];
+        int pos = blk * BLOCK + int(t);
+        int col = pos + (HAS_PAD ? int(pad[b]) : 0);
+        bool valid = blk >= 0 && pos <= qpos[int(b) * L + l] && col < total_len;
+        if (HAS_MASK && valid) {
+            valid = vk[int(b) * vk_strides[0] + l * vk_strides[2] + col * vk_strides[3]];
+        }
+        // Skipped keys get probability 0 below; pointing them at column 0
+        // keeps the value loads in bounds and branch-free.
+        col_s[t] = valid ? col : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float s[G];
+        for (int h = 0; h < G; ++h) {
+            s[h] = 0.0f;
+        }
+        int k_off = int(b) * k_strides[0] + kv * k_strides[1] + col_s[t] * k_strides[2];
+        int ks = k_strides[3];
+        for (int d0 = 0; d0 < D; d0 += 32) {
+            float4 kc[8];
+            for (int j = 0; j < 8; ++j) {
+                int o = k_off + (d0 + 4 * j) * ks;
+                kc[j] = float4(float(k[o]), float(k[o + ks]), float(k[o + 2 * ks]), float(k[o + 3 * ks]));
+            }
+            for (int h = 0; h < G; ++h) {
+                float acc = 0.0f;
+                for (int j = 0; j < 8; ++j) {
+                    acc += dot(q_s[(h * D + d0) / 4 + j], kc[j]);
+                }
+                s[h] += acc;
+            }
+        }
+        for (int h = 0; h < G; ++h) {
+            p_s[h * BLOCK + int(t)] = valid ? s[h] : -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int h = int(simd); h < G; h += BLOCK / 32) {
+            float m = -INFINITY;
+            for (int j = int(lane); j < BLOCK; j += 32) {
+                m = max(m, p_s[h * BLOCK + j]);
+            }
+            m = simd_max(m);
+            float sum = 0.0f;
+            for (int j = int(lane); j < BLOCK; j += 32) {
+                float e = m == -INFINITY ? 0.0f : fast::exp(p_s[h * BLOCK + j] - m);
+                p_s[h * BLOCK + j] = e;
+                sum += e;
+            }
+            sum = simd_sum(sum);
+            if (lane == 0) {
+                m_s[h] = m;
+                l_s[h] = sum;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Partials are stored in block order, so the merge does not depend on
+        // the order the selection returned the blocks in.
+        int rank = 0;
+        for (int r = 0; r < TOPK; ++r) {
+            int other = block_ids[row * TOPK + r];
+            rank += other < blk || (other == blk && r < int(slot));
+        }
+        int part = (row * TOPK + rank) * G;
+        for (int d = int(t); d < D; d += BLOCK) {
+            float acc[G];
+            for (int h = 0; h < G; ++h) {
+                acc[h] = 0.0f;
+            }
+            int v_base = int(b) * v_strides[0] + kv * v_strides[1] + d * v_strides[3];
+            for (int j0 = 0; j0 < BLOCK; j0 += 8) {
+                float vv[8];
+                for (int u = 0; u < 8; ++u) {
+                    vv[u] = float(v[v_base + col_s[j0 + u] * v_strides[2]]);
+                }
+                for (int u = 0; u < 8; ++u) {
+                    for (int h = 0; h < G; ++h) {
+                        acc[h] += p_s[h * BLOCK + j0 + u] * vv[u];
+                    }
+                }
+            }
+            for (int h = 0; h < G; ++h) {
+                part_o[(part + h) * D + d] = acc[h];
+            }
+        }
+        if (t < uint(G)) {
+            part_m[part + int(t)] = m_s[t];
+            part_l[part + int(t)] = l_s[t];
+        }
+    """,
+)
+
+_MSA_SMALL_L_COMBINE = mx.fast.metal_kernel(
+    name="minimax_m3_msa_small_l_combine",
+    input_names=["part_o", "part_m", "part_l"],
+    output_names=["out"],
+    source=r"""
+        uint d = thread_position_in_grid.x;
+        uint hl = thread_position_in_grid.y;
+        uint b = thread_position_in_grid.z;
+        if (d >= uint(D)) {
+            return;
+        }
+        int hq = int(hl) / L;
+        int l = int(hl) % L;
+        int kv = hq / G;
+        int h = hq % G;
+        int row = (int(b) * H_KV + kv) * L + l;
+        float m_max = -INFINITY;
+        for (int s = 0; s < TOPK; ++s) {
+            m_max = max(m_max, part_m[(row * TOPK + s) * G + h]);
+        }
+        float num = 0.0f;
+        float den = 0.0f;
+        if (m_max != -INFINITY) {
+            for (int s = 0; s < TOPK; ++s) {
+                int p = (row * TOPK + s) * G + h;
+                float w = fast::exp(part_m[p] - m_max);
+                num += w * part_o[p * D + int(d)];
+                den += w * part_l[p];
+            }
+        }
+        out[((int(b) * H_KV * G + hq) * L + l) * D + int(d)] =
+            T(den > 0.0f ? num / den : 0.0f);
+    """,
+)
+
+
+def small_l_sparse_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    block_ids: mx.array,
+    qpos: mx.array,
+    left_padding: Optional[mx.array],
+    block_size: int,
+    scale: float,
+    valid_keys: Optional[mx.array] = None,
+) -> Optional[mx.array]:
+    """``[B, H, L, D]`` sparse attention over each query's own blocks, or None.
+
+    ``block_ids`` is ``[B, H_kv, L, topk]`` (or one shared index head) in the
+    row's own positions. Keys after the query position, outside the row or
+    dropped by the ``[B, 1, L, S]`` ``valid_keys`` mask are skipped.
+    """
+    B, H, L, D = queries.shape
+    _, H_kv, total_len, _ = keys.shape
+    topk = block_ids.shape[-1]
+    if (
+        not mx.metal.is_available()
+        or L > SMALL_L_BLOCK_SCORES_MAX_QUERIES
+        or block_ids.shape[1] not in (1, H_kv)
+        or H % H_kv
+        or block_size % 32
+        or block_size > 1024
+        or D % 32
+        or (H // H_kv) * (D + block_size) * 4 > 24576
+    ):
+        return None
+    G = H // H_kv
+    if block_ids.shape[1] != H_kv:
+        block_ids = mx.broadcast_to(block_ids, (B, H_kv, L, topk))
+    block_ids = mx.contiguous(block_ids.astype(mx.int32))
+    qpos = mx.contiguous(qpos.astype(mx.int32))
+    if valid_keys is not None:
+        valid_keys = mx.broadcast_to(valid_keys, (B, 1, L, total_len))
+    template = [
+        ("T", queries.dtype),
+        ("H_KV", H_kv),
+        ("G", G),
+        ("L", L),
+        ("D", D),
+        ("BLOCK", block_size),
+        ("TOPK", topk),
+        ("HAS_MASK", valid_keys is not None),
+        ("HAS_PAD", left_padding is not None),
+    ]
+    rows = B * H_kv * L * topk * G
+    part_o, part_m, part_l = _MSA_SMALL_L_PARTIALS(
+        inputs=[
+            mx.contiguous(queries),
+            keys,
+            values,
+            block_ids,
+            qpos,
+            _row_pad(left_padding, B, qpos),
+            mx.array([total_len], dtype=mx.int32),
+            mx.array([scale], dtype=mx.float32),
+            qpos if valid_keys is None else valid_keys,
+        ],
+        template=template,
+        grid=(topk * block_size, H_kv * L, B),
+        threadgroup=(block_size, 1, 1),
+        output_shapes=[(rows, D), (rows,), (rows,)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    return _MSA_SMALL_L_COMBINE(
+        inputs=[part_o, part_m, part_l],
+        template=template,
+        grid=(D, H * L, B),
+        threadgroup=(min(D, 256), 1, 1),
+        output_shapes=[(B, H, L, D)],
+        output_dtypes=[queries.dtype],
+    )[0]

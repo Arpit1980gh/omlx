@@ -190,3 +190,117 @@ def test_left_padded_batch_decode_matches_single_rows(language):
         np.testing.assert_allclose(
             np.array(batched[row]), np.array(single[0]), atol=1e-5
         )
+
+
+@pytest.mark.parametrize("length", [1, 8])
+def test_small_l_block_score_kernel_matches_numpy(language, length):
+    import mlx_vlm.models.minimax_m3_vl.msa as msa
+
+    batch, heads, dim, total, block = 2, 4, 128, 700, 32
+    pad = np.array([37, 0], dtype=np.int32)
+    rng = np.random.default_rng(1)
+    idx_q = rng.standard_normal((batch, heads, length, dim)).astype(np.float32)
+    keys = rng.standard_normal((batch, 1, total + 64, dim)).astype(np.float32)
+    qpos = np.stack([np.arange(total - p - length, total - p) for p in pad]).astype(
+        np.int32
+    )
+    q_mx = mx.array(idx_q).astype(mx.bfloat16)
+    k_mx = mx.array(keys).astype(mx.bfloat16)[:, :, :total]
+
+    scores = msa.small_l_block_scores(
+        q_mx, k_mx, mx.array(qpos), mx.array(pad), block, 0, 1
+    )
+    assert scores is not None
+    scores = -np.array(scores)
+
+    q32 = np.array(q_mx.astype(mx.float32))
+    k32 = np.array(k_mx.astype(mx.float32))
+    num_blocks = -(-total // block)
+    for b in range(batch):
+        for h in range(heads):
+            for t in range(length):
+                p = int(qpos[b, t])
+                for blk in range(num_blocks):
+                    got = scores[b, h, t, blk]
+                    if blk > p // block:
+                        assert got == -np.inf
+                    elif blk == p // block:
+                        assert got == 1e29
+                    else:
+                        cols = [
+                            j + pad[b]
+                            for j in range(blk * block, (blk + 1) * block)
+                            if j + pad[b] < total
+                        ]
+                        expected = max(float(q32[b, h, t] @ k32[b, 0, c]) for c in cols)
+                        assert abs(got - expected) <= 1e-3 * max(1.0, abs(expected))
+
+
+def test_small_l_sparse_attention_kernel_matches_reference(language):
+    import mlx_vlm.models.minimax_m3_vl.msa as msa
+
+    batch, heads, kv_heads, length, dim = 2, 8, 2, 8, 128
+    total, block, topk = 700, 32, 4
+    pad = np.array([37, 0], dtype=np.int32)
+    rng = np.random.default_rng(2)
+    q, k, v = (
+        mx.array(rng.standard_normal(shape).astype(np.float32)).astype(mx.bfloat16)
+        for shape in (
+            (batch, heads, length, dim),
+            (batch, kv_heads, total, dim),
+            (batch, kv_heads, total, dim),
+        )
+    )
+    keep = rng.random((batch, 1, length, total)) > 0.1
+    qpos = np.stack([np.arange(total - p - length, total - p) for p in pad]).astype(
+        np.int32
+    )
+    block_ids = mx.array(
+        np.stack(
+            [rng.permutation(qpos[b, -1] // block + 1)[:topk] for b in range(batch)]
+        )[:, None, None, :]
+        .repeat(kv_heads, 1)
+        .repeat(length, 2),
+        dtype=mx.int32,
+    )
+    scale = dim**-0.5
+
+    out = msa.small_l_sparse_attention(
+        q, k, v, block_ids, mx.array(qpos), mx.array(pad), block, scale, mx.array(keep)
+    )
+    assert out is not None
+
+    q32, k32, v32 = (np.array(x.astype(mx.float32)) for x in (q, k, v))
+    ids = np.array(block_ids)
+    expected = np.zeros_like(q32)
+    for b in range(batch):
+        for qh in range(heads):
+            h = qh // (heads // kv_heads)
+            for t in range(length):
+                cols = [
+                    pad[b] + j
+                    for blk in ids[b, h, t]
+                    for j in range(blk * block, (blk + 1) * block)
+                    if j <= qpos[b, t] and keep[b, 0, t, pad[b] + j]
+                ]
+                logits = scale * (k32[b, h, cols] @ q32[b, qh, t])
+                weights = np.exp(logits - logits.max())
+                expected[b, qh, t] = (weights / weights.sum()) @ v32[b, h, cols]
+    np.testing.assert_allclose(
+        np.array(out.astype(mx.float32)), expected, atol=2e-2, rtol=2e-2
+    )
+
+    # A verify row computes exactly like a one-token decode step, whatever
+    # order the selection returns the blocks in.
+    last = msa.small_l_sparse_attention(
+        q[:, :, -1:],
+        k,
+        v,
+        block_ids[:, :, -1:, ::-1],
+        mx.array(qpos[:, -1:]),
+        mx.array(pad),
+        block,
+        scale,
+        mx.array(keep[:, :, -1:]),
+    )
+    assert mx.array_equal(last, out[:, :, -1:]).item()

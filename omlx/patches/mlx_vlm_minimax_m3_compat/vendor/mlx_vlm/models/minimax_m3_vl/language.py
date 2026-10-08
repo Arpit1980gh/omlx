@@ -19,6 +19,8 @@ from .msa import (
     build_grouped_msa_topk,
     build_grouped_msa_topk_blockwise,
     msa_sparse_attention_b1,
+    small_l_block_scores,
+    small_l_sparse_attention,
 )
 
 _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY = 0.5
@@ -117,6 +119,22 @@ def _sparse_block_selection(
     """
     B, H_idx, L, _ = idx_queries.shape
     total_len = idx_keys.shape[2]
+    num_blocks = (total_len + block_size - 1) // block_size
+    k = min(topk_blocks, num_blocks)
+    if score_type == "max":
+        negated = small_l_block_scores(
+            idx_queries,
+            idx_keys,
+            qpos,
+            left_padding,
+            block_size,
+            init_blocks,
+            local_blocks,
+        )
+        if negated is not None:
+            return mx.argpartition(negated, kth=k - 1, axis=-1)[..., :k].astype(
+                mx.int32
+            )
     neg = mx.array(-float("inf"), dtype=mx.float32)
 
     # The softmax scale is a positive constant and does not change the order.
@@ -137,7 +155,6 @@ def _sparse_block_selection(
     positions = mx.arange(total_len)
     scores = mx.where(positions[None, None, None, :] <= qpos[:, None, :, None], scores, neg)
 
-    num_blocks = (total_len + block_size - 1) // block_size
     tail = num_blocks * block_size - total_len
     if tail:
         scores = mx.concatenate(
@@ -163,7 +180,6 @@ def _sparse_block_selection(
         forced = (blocks[None, None, None, :] >= local_start[:, None, :, None]) & valid
         selected = mx.where(forced, mx.array(1e29, dtype=selected.dtype), selected)
 
-    k = min(topk_blocks, num_blocks)
     return mx.argpartition(-selected, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
 
 
@@ -1164,7 +1180,7 @@ class MiniMaxAttention(nn.Module):
                 )
                 valid_keys = _attention_valid_keys(mask)
                 if L <= _SPARSE_COMPACT_MAX_QUERIES:
-                    output = _compact_sparse_attention(
+                    sparse_args = (
                         queries,
                         keys,
                         values,
@@ -1175,6 +1191,9 @@ class MiniMaxAttention(nn.Module):
                         self.scale,
                         valid_keys,
                     )
+                    output = small_l_sparse_attention(*sparse_args)
+                    if output is None:
+                        output = _compact_sparse_attention(*sparse_args)
                 else:
                     token_mask = _sparse_token_mask(
                         block_ids,
