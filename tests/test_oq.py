@@ -303,6 +303,26 @@ class TestUniversalQuantPredicate:
         result = universal_quant_predicate(path, module, config, 3.5)
         assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "language_model.model.layers.0.self_attn.index_q_proj",
+            "language_model.model.layers.59.self_attn.index_k_proj.weight",
+        ],
+    )
+    def test_minimax_sparse_indexer_is_mandatory_q8(self, path, module):
+        config = {
+            "model_type": "minimax_m3_vl",
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {path.removesuffix(".weight"): {"bits": 5}},
+        }
+        result = universal_quant_predicate(path, module, config, 3)
+        assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
+        other = universal_quant_predicate(
+            "language_model.model.layers.0.self_attn.q_proj", module, config, 3
+        )
+        assert other != result
+
     @pytest.mark.parametrize("model_type", ["deepseek_v32", "deepseek_v4"])
     def test_glm_dsa_indexer_q8_rule_does_not_touch_deepseek(self, model_type, module):
         result = universal_quant_predicate(
@@ -6385,6 +6405,25 @@ class TestMiniMaxSharedExpertLayout:
         }
         assert not _configure_minimax_shared_expert_layout(config, 4)
         assert "pack_shared_expert" not in config["text_config"]
+
+    def test_bundled_dspark_draft_is_copied_to_the_output(self, tmp_path):
+        from omlx.oq import _copy_bundled_drafts
+
+        source, output = tmp_path / "src", tmp_path / "out"
+        draft = source / "dspark"
+        draft.mkdir(parents=True)
+        output.mkdir()
+        (draft / "config.json").write_text(
+            json.dumps({"architectures": ["DSparkMiniMaxDraftModel"]})
+        )
+        (draft / "model-dspark-00001.safetensors").write_bytes(b"weights")
+
+        _copy_bundled_drafts(source, output)
+
+        assert (output / "dspark" / "config.json").is_file()
+        assert (output / "dspark" / "model-dspark-00001.safetensors").read_bytes() == (
+            b"weights"
+        )
 
     def test_mxfp8_scale_inv_passthrough_requires_minimax_source(self, config):
         config["quantization_config"] = {"quant_method": "mxfp8"}

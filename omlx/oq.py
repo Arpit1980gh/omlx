@@ -33,6 +33,7 @@ try:
     from mlx.utils import tree_flatten, tree_unflatten
     from mlx_lm.models.base import create_attention_mask
 
+    from omlx.patches import minimax_m3_dspark as minimax_dspark
     from omlx.patches.mlx_vlm_minimax_m3_compat import virtual_nvfp4 as minimax_nvfp4
 
     HAS_MLX = True
@@ -59,6 +60,7 @@ _OQ_DEFAULT_GROUP_SIZE = 64
 
 _GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 _GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
+_MINIMAX_INDEXER_PROJECTIONS = ("index_q_proj", "index_k_proj")
 
 _QWEN4_EXP_NGRAM_GROUP_SIZE = 32
 _QWEN4_EXP_NGRAM_SHARD_RE = re.compile(
@@ -576,6 +578,30 @@ def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
     return dict(_GLM_INDEXER_Q8)
 
 
+def _minimax_indexer_q8_override(path: str, config: dict) -> dict | None:
+    """Return the mandatory Q8 spec for MiniMax M3 sparse-attention indexers.
+
+    The indexer picks which key blocks every query attends to, so quantization
+    error changes the selection itself rather than adding noise. Its two
+    projections are about 236M parameters on M3.1, so Q8 adds roughly 0.1 GB.
+    From an MXFP8 source the Q8 floor passes the source bytes through.
+    """
+    if not _is_minimax_m3_config(config):
+        return None
+    path = _normalize_quant_path(path)
+    if not path.endswith(
+        tuple(f".self_attn.{name}" for name in _MINIMAX_INDEXER_PROJECTIONS)
+    ):
+        return None
+    return dict(_GLM_INDEXER_Q8)
+
+
+def _indexer_q8_override(path: str, config: dict) -> dict | None:
+    return _glm_indexer_q8_override(path, config) or _minimax_indexer_q8_override(
+        path, config
+    )
+
+
 def _is_qwen4_exp_ngram_embedding_tensor(path: str, config: dict) -> bool:
     """Return whether *path* is one Qwen4-Exp PLE embedding shard.
 
@@ -636,9 +662,9 @@ def universal_quant_predicate(
     if path in non_quantizable:
         return False
 
-    glm_indexer_override = _glm_indexer_q8_override(path, config)
-    if glm_indexer_override is not None:
-        return glm_indexer_override
+    indexer_override = _indexer_q8_override(path, config)
+    if indexer_override is not None:
+        return indexer_override
 
     tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
@@ -1204,13 +1230,13 @@ def _build_quant_plan(
     boost_map: dict[str, dict] = {}
     fixed_overrides = fixed_overrides or {}
 
-    # GLM DSA indexers are a format invariant, not an optional sensitivity
-    # boost. Seed them before pricing the plan and never let the bpw cap drop
+    # GLM DSA and MiniMax indexers are a format invariant, not an optional
+    # sensitivity boost. Seed them before pricing the plan and never let the bpw cap drop
     # them. On GLM-5.2 all 22 indexers together are only about 209 MiB at Q8.
     for path in named_shapes:
         if path in fixed_overrides:
             continue
-        override = _glm_indexer_q8_override(path, config)
+        override = _indexer_q8_override(path, config)
         if override is not None:
             boost_map[path] = override
 
@@ -4711,6 +4737,17 @@ def _copy_model_sidecars(
         shutil.copy2(py_file, output / py_file.name)
 
 
+def _copy_bundled_drafts(source: Path, output: Path) -> None:
+    """Copy a bundled speculative draft checkpoint next to the output.
+
+    MiniMax M3.1 ships its DSpark draft in ``dspark/``. The draft stays in its
+    source precision: it is small and only affects draft acceptance.
+    """
+    draft = minimax_dspark.bundled_dspark_path(source)
+    if draft is not None:
+        shutil.copytree(draft, output / draft.name, dirs_exist_ok=True)
+
+
 def _build_non_quantizable_set(config: dict) -> set:
     """Find module paths with 2D weights that lack to_quantized() support.
 
@@ -7452,6 +7489,8 @@ def quantize_oq_streaming(
     for name in DECISION_SIDECAR_FILES:
         if (source / name).is_file():
             shutil.copy2(source / name, output / name)
+    if not text_only:
+        _copy_bundled_drafts(source, output)
 
     if mimo_multimodal:
         from .patches.mimo_v2.omnimodal import export_sidecars
