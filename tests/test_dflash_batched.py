@@ -678,6 +678,9 @@ def test_short_context_matches_reference_draft_block(make_drafter, longest):
         got = drafter._draft_batched(
             [(SimpleNamespace(uid=0), row, context, anchor, None)]
         )[0][0]
+        if isinstance(got, list):
+            # DSpark proposals come as one lazy token per position.
+            got = mx.concatenate(got)[None]
         assert got.tolist() == expected.tolist()
 
 
