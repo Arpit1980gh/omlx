@@ -22,6 +22,7 @@ from .msa import (
     small_l_block_scores,
     small_l_sparse_attention,
 )
+from .moe_rows import scaled_switch_glu
 from .qmv_rows import mxfp8_rows_matmul, rows_linear
 
 _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY = 0.5
@@ -832,6 +833,9 @@ class MiniMaxScaledSwitchGLU(SwitchGLU):
         self.down_scale = mx.ones((num_experts,), dtype=mx.float32)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        y = scaled_switch_glu(self, x, indices)
+        if y is not None:
+            return y
         x = mx.expand_dims(x, (-2, -3))
 
         indices = mx.stop_gradient(indices)

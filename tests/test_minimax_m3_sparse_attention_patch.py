@@ -254,6 +254,36 @@ def test_short_row_mxfp8_matmul_matches_one_row_decode(language, rows):
     assert mx.array_equal(qmv_rows.rows_linear(proj, x), expected).item()
 
 
+@pytest.mark.parametrize("rows", [1, 4, 8])
+def test_short_row_nvfp4_experts_match_stock_switch(language, monkeypatch, rows):
+    import mlx_vlm.models.minimax_m3_vl.moe_rows as moe_rows
+
+    mx.random.seed(7)
+    experts = 16
+    switch = language.MiniMaxScaledSwitchGLU(
+        512, 512, experts, language.MiniMaxSwiGLUOAI()
+    )
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        linear = switch[name]
+        linear.weight = mx.random.normal(linear.weight.shape) * 0.05
+        switch[name] = linear.to_quantized(group_size=16, bits=4, mode="nvfp4")
+    switch.gate_scale = mx.random.uniform(0.5, 30.0, (experts,))
+    switch.up_scale = mx.random.uniform(0.5, 30.0, (experts,))
+    x = (mx.random.normal((1, rows, 512)) * 2).astype(mx.bfloat16)
+    # Every other row repeats the first row's experts, so shared experts are
+    # computed once for several rows.
+    first = mx.random.permutation(experts)[:4]
+    picks = [
+        first if r % 2 == 0 else mx.random.permutation(experts)[:4] for r in range(rows)
+    ]
+    indices = mx.stack(picks)[None].astype(mx.uint32)
+
+    fused = switch(x, indices)
+    monkeypatch.setattr(moe_rows, "MAX_ROWS", 0)
+    stock = switch(x, indices)
+    assert mx.array_equal(fused, stock).item()
+
+
 @pytest.mark.parametrize("length", [1, 8])
 def test_small_l_block_score_kernel_matches_numpy(language, length):
     import mlx_vlm.models.minimax_m3_vl.msa as msa
