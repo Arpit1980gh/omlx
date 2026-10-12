@@ -29,6 +29,16 @@ _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK = 2
 # Up to this many query tokens (decode, speculative verify) gather their
 # selected blocks; longer chunks use one sparse keep-mask per KV head.
 _SPARSE_COMPACT_MAX_QUERIES = 16
+# Projections of the attention input that short calls run as one matmul.
+_INPUT_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "index_q_proj", "index_k_proj")
+# MLX runs calls this short as matrix-vector products that compute every
+# output row on its own, so the fused matmul matches the separate projections
+# bit for bit. Longer calls tile the output and can round differently.
+_FUSED_PROJECTION_MAX_ROWS = 8
+# Short calls start encoding every this many layers while the rest of the
+# graph is still being built, so the GPU does not wait for the whole step's
+# Python graph. Scheduling only; the computed values are unchanged.
+_SHORT_CALL_EVAL_EVERY = 4
 
 
 def _is_bool_mask(mask: mx.array) -> bool:
@@ -851,6 +861,80 @@ class MiniMaxScaledSwitchGLU(SwitchGLU):
         return x.squeeze(-2)
 
 
+class _FusedProjections:
+    """Same-format quantized projections concatenated along the output rows."""
+
+    __slots__ = ("names", "splits", "weight", "scales", "biases", "quant", "views")
+
+    def __init__(self, names, splits, weight, scales, biases, quant, views):
+        self.names = names
+        self.splits = splits
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.quant = quant
+        self.views = views
+
+    def current(self, attn) -> bool:
+        # A later weight load replaces the row views, so the fusion is rebuilt.
+        return all(
+            attn[name].get("weight") is view
+            for name, view in zip(self.names, self.views)
+        )
+
+    def __call__(self, x: mx.array):
+        y = mx.quantized_matmul(
+            x, self.weight, self.scales, self.biases, transpose=True, **self.quant
+        )
+        return zip(self.names, mx.split(y, self.splits, axis=-1))
+
+
+def _fuse_projections(attn, names) -> List[_FusedProjections]:
+    """Concatenate same-format projections once and rebind them to row views.
+
+    The projections keep working on slices of the fused buffers, so the
+    weights are not duplicated.
+    """
+    by_format = {}
+    for name in names:
+        proj = attn[name]
+        # Sharded subclasses add collectives to the forward; keep them as is.
+        if type(proj) is not nn.QuantizedLinear or "bias" in proj:
+            continue
+        key = (proj.group_size, proj.bits, proj.mode, proj.get("biases") is not None)
+        by_format.setdefault(key, []).append(name)
+
+    fused = []
+    for (group_size, bits, mode, has_biases), members in by_format.items():
+        if len(members) < 2:
+            continue
+        projs = [attn[name] for name in members]
+        keys = ("weight", "scales", "biases") if has_biases else ("weight", "scales")
+        buffers = {k: mx.concatenate([p[k] for p in projs], axis=0) for k in keys}
+        mx.eval(list(buffers.values()))
+        ends = []
+        start = 0
+        for proj in projs:
+            rows = proj["weight"].shape[0]
+            for k in keys:
+                proj[k] = buffers[k][start : start + rows]
+            start += rows
+            ends.append(start)
+        mx.eval([proj[k] for proj in projs for k in keys])
+        fused.append(
+            _FusedProjections(
+                tuple(members),
+                ends[:-1],
+                buffers["weight"],
+                buffers["scales"],
+                buffers.get("biases"),
+                {"group_size": group_size, "bits": bits, "mode": mode},
+                tuple(proj["weight"] for proj in projs),
+            )
+        )
+    return fused
+
+
 class MiniMaxAttention(nn.Module):
     def __init__(self, args: TextConfig, layer_idx: int):
         super().__init__()
@@ -1070,6 +1154,21 @@ class MiniMaxAttention(nn.Module):
         )
         return out.transpose(1, 0, 2)[None]
 
+    def _input_projections(self, x: mx.array) -> dict:
+        names = _INPUT_PROJECTIONS if self.has_sparse_index else _INPUT_PROJECTIONS[:3]
+        out = {}
+        if x.shape[0] * x.shape[1] <= _FUSED_PROJECTION_MAX_ROWS:
+            fused = self.__dict__.get("_omlx_fused_projections")
+            if fused is None or not all(group.current(self) for group in fused):
+                fused = _fuse_projections(self, names)
+                self.__dict__["_omlx_fused_projections"] = fused
+            for group in fused:
+                out.update(group(x))
+        for name in names:
+            if name not in out:
+                out[name] = self[name](x)
+        return out
+
     def __call__(
         self,
         x: mx.array,
@@ -1091,9 +1190,10 @@ class MiniMaxAttention(nn.Module):
             cache is None or hasattr(cache, "update_index_and_fetch")
         )
 
-        queries = self.q_proj(x)
-        keys = self.k_proj(x)
-        values = self.v_proj(x)
+        projected = self._input_projections(x)
+        queries = projected["q_proj"]
+        keys = projected["k_proj"]
+        values = projected["v_proj"]
         queries = queries.reshape(B, L, self.num_attention_heads, self.head_dim)
         keys = keys.reshape(B, L, self.num_key_value_heads, self.head_dim)
         values = values.reshape(B, L, self.num_key_value_heads, self.head_dim)
@@ -1104,8 +1204,8 @@ class MiniMaxAttention(nn.Module):
             keys = self.k_norm(keys, dtype=mx.float32)
 
         if use_sparse_mask:
-            idx_queries = self.index_q_proj(x)
-            idx_keys = self.index_k_proj(x)
+            idx_queries = projected["index_q_proj"]
+            idx_keys = projected["index_k_proj"]
             idx_queries = idx_queries.reshape(B, L, self.index_heads, self.index_dim)
             idx_keys = idx_keys.reshape(B, L, 1, self.index_dim)
             idx_queries = self.index_q_norm(idx_queries, dtype=mx.float32)
@@ -1401,10 +1501,16 @@ class MiniMaxM3Model(nn.Module):
             )
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        eval_every = (
+            _SHORT_CALL_EVAL_EVERY if h.shape[1] <= _SPARSE_COMPACT_MAX_QUERIES else 0
+        )
+        n_layers = len(self.layers)
         for idx, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, mask, c, position_ids=position_ids)
             if hidden_sink is not None and idx in capture_set:
                 hidden_sink.append(h)
+            if eval_every and (idx + 1) % eval_every == 0 and idx + 1 < n_layers:
+                mx.async_eval(h)
 
         if hidden_sink is not None and not capture_set:
             hidden_sink.append(h)

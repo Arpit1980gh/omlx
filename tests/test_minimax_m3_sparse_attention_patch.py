@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
 
 BLOCK = 4
 TOPK = 3
@@ -141,7 +142,7 @@ def test_compact_and_masked_paths_match_reference(language):
     np.testing.assert_allclose(np.array(masked), expected, atol=1e-5)
 
 
-def test_left_padded_batch_decode_matches_single_rows(language):
+def _tiny_attention(language):
     from mlx_vlm.models.minimax_m3_vl.config import TextConfig
 
     args = TextConfig(
@@ -163,8 +164,12 @@ def test_left_padded_batch_decode_matches_single_rows(language):
             "sparse_score_type": "max",
         },
     )
+    return language.MiniMaxAttention(args, 0)
+
+
+def test_left_padded_batch_decode_matches_single_rows(language):
     mx.random.seed(3)
-    attention = language.MiniMaxAttention(args, 0)
+    attention = _tiny_attention(language)
     lengths = (37, 50)
     prompts = [mx.random.normal((1, n, 64)) for n in lengths]
     steps = [mx.random.normal((1, 1, 64)) for _ in lengths]
@@ -190,6 +195,50 @@ def test_left_padded_batch_decode_matches_single_rows(language):
         np.testing.assert_allclose(
             np.array(batched[row]), np.array(single[0]), atol=1e-5
         )
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_short_calls_fuse_input_projections_bit_exactly(language, monkeypatch, mixed):
+    mx.random.seed(5)
+    attention = _tiny_attention(language)
+
+    def spec(path, module):
+        if not isinstance(module, nn.Linear):
+            return False
+        if mixed and path in ("q_proj", "k_proj", "v_proj"):
+            return {"group_size": 32, "bits": 5, "mode": "affine"}
+        return {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+
+    nn.quantize(attention, class_predicate=spec)
+    prompt = mx.random.normal((1, 40, 64))
+    steps = [mx.random.normal((1, n, 64)) for n in (1, 4, 8)]
+
+    def run():
+        cache = language.MiniMaxM3KVCache()
+        outs = [attention(prompt, mask="causal", cache=cache)]
+        for step in steps:
+            outs.append(attention(step, cache=cache))
+            cache.trim(step.shape[1])
+        mx.eval(outs)
+        return outs
+
+    monkeypatch.setattr(language, "_FUSED_PROJECTION_MAX_ROWS", 0)
+    separate = run()
+    assert "_omlx_fused_projections" not in attention.__dict__
+    monkeypatch.undo()
+    fused = run()
+
+    groups = attention.__dict__["_omlx_fused_projections"]
+    names = [group.names for group in groups]
+    if mixed:
+        assert names == [
+            ("q_proj", "k_proj", "v_proj"),
+            ("index_q_proj", "index_k_proj"),
+        ]
+    else:
+        assert names == [language._INPUT_PROJECTIONS]
+    for a, b in zip(separate, fused):
+        assert mx.array_equal(a, b).item()
 
 
 @pytest.mark.parametrize("length", [1, 8])
