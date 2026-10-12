@@ -1049,3 +1049,20 @@ def test_minimax_dspark_sanitize_maps_checkpoint_layout():
     assert sanitized["layers.0.self_attn.q_proj.weight"].dtype == mx.uint32
     assert sanitized["layers.0.self_attn.q_proj.weight"].shape == (4, 16)
 
+
+def test_dspark_context_only_cycle_keeps_the_next_block():
+    """A copy cycle only queues its rows; the next drafted block is unchanged."""
+    first, second = _captured(5, seed=31), _captured(4, seed=32)
+    anchors = (mx.array([7], dtype=mx.uint32), mx.array([12], dtype=mx.uint32))
+
+    drafting = _tiny_minimax_dspark()
+    every_cycle = SimpleNamespace(uid=0, depth=BLOCK, controller=None)
+    drafting.draft([(None, every_cycle, first, anchors[0], None)])
+    drafting.draft([(None, every_cycle, second, anchors[1], None)])
+
+    copying = _tiny_minimax_dspark()
+    after_copy = SimpleNamespace(uid=0, depth=BLOCK, controller=None)
+    copying.extend_context(after_copy, first)
+    copying.draft([(None, after_copy, second, anchors[1], None)])
+
+    assert after_copy.drafts.tolist() == every_cycle.drafts.tolist()

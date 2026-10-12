@@ -288,6 +288,7 @@ def wrap_minimax_dspark(model: MiniMaxDSparkDraftModel, source_path: str):
     # different acceptance verify against their own extracted caches.
     drafter.independent_verify = True
     drafter.query_windows = True
+    drafter.context_copy = True
     return drafter
 
 

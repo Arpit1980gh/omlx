@@ -150,6 +150,9 @@ class DFlashDrafter:
         # Sliding-window draft layers: block query j attends the context
         # window ending at its own position instead of the block's start.
         self.query_windows = False
+        # A context copy that fills the block may replace the drafted block
+        # (Lightning MTP's prompt lookup); the target still verifies it.
+        self.context_copy = False
 
     @property
     def window(self) -> int:
@@ -504,6 +507,11 @@ class DFlashDrafter:
             tokens, accept_lps = tokens[:count], accept_lps[:count]
         mx.async_eval(tokens, *selection.q_arrays(accept_lps))
         return True
+
+    def extend_context(self, state, captured) -> None:
+        """Queue committed rows as context without drafting a block."""
+        if captured:
+            self._queue(self._row(state.uid), _concat_captured(captured))
 
     def adopt_predraft(self, state, count: int) -> None:
         """Commit the queued block: ``count`` verify rows entered the context."""
