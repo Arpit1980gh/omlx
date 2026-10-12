@@ -241,6 +241,19 @@ def test_short_calls_fuse_input_projections_bit_exactly(language, monkeypatch, m
         assert mx.array_equal(a, b).item()
 
 
+@pytest.mark.parametrize("rows", [3, 5, 6, 8])
+def test_short_row_mxfp8_matmul_matches_one_row_decode(language, rows):
+    import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
+
+    mx.random.seed(6)
+    proj = nn.QuantizedLinear.from_linear(
+        nn.Linear(512, 64, bias=False), group_size=32, bits=8, mode="mxfp8"
+    )
+    x = mx.random.normal((1, rows, 512)).astype(mx.bfloat16)
+    expected = mx.concatenate([proj(x[:, i : i + 1]) for i in range(rows)], axis=1)
+    assert mx.array_equal(qmv_rows.rows_linear(proj, x), expected).item()
+
+
 @pytest.mark.parametrize("length", [1, 8])
 def test_small_l_block_score_kernel_matches_numpy(language, length):
     import mlx_vlm.models.minimax_m3_vl.msa as msa

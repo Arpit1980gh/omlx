@@ -22,6 +22,7 @@ from .msa import (
     small_l_block_scores,
     small_l_sparse_attention,
 )
+from .qmv_rows import mxfp8_rows_matmul, rows_linear
 
 _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY = 0.5
 _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN = 32768
@@ -764,7 +765,9 @@ class MiniMaxMLP(nn.Module):
         self.act_fn = MiniMaxSwiGLUOAI(alpha, limit, beta)
 
     def __call__(self, x):
-        return self.down_proj(self.act_fn(self.up_proj(x), self.gate_proj(x)))
+        up = rows_linear(self.up_proj, x)
+        gate = rows_linear(self.gate_proj, x)
+        return rows_linear(self.down_proj, self.act_fn(up, gate))
 
 
 class MiniMaxPackedSwitchGLU(nn.Module):
@@ -883,9 +886,11 @@ class _FusedProjections:
         )
 
     def __call__(self, x: mx.array):
-        y = mx.quantized_matmul(
-            x, self.weight, self.scales, self.biases, transpose=True, **self.quant
-        )
+        y = mxfp8_rows_matmul(x, self.weight, self.scales, self.quant)
+        if y is None:
+            y = mx.quantized_matmul(
+                x, self.weight, self.scales, self.biases, transpose=True, **self.quant
+            )
         return zip(self.names, mx.split(y, self.splits, axis=-1))
 
 
@@ -1258,7 +1263,7 @@ class MiniMaxAttention(nn.Module):
                     )
                     if output is not None:
                         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                        return self.o_proj(output)
+                        return rows_linear(self.o_proj, output)
 
                 qpos = self._sparse_query_positions(
                     B, L, int(sparse_q_start), sparse_q_positions
@@ -1306,7 +1311,7 @@ class MiniMaxAttention(nn.Module):
                         queries, keys, values, token_mask, self.scale, valid_keys
                     )
                 output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                return self.o_proj(output)
+                return rows_linear(self.o_proj, output)
         else:
             mask = self._normalize_attention_mask(
                 mask, B, L, keys.shape[2], causal=True
@@ -1316,7 +1321,7 @@ class MiniMaxAttention(nn.Module):
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        return rows_linear(self.o_proj, output)
 
 
 class MiniMaxSparseMoeBlock(nn.Module):
