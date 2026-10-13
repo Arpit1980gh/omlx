@@ -142,10 +142,10 @@ def test_compact_and_masked_paths_match_reference(language):
     np.testing.assert_allclose(np.array(masked), expected, atol=1e-5)
 
 
-def _tiny_attention(language):
+def _tiny_args(**overrides):
     from mlx_vlm.models.minimax_m3_vl.config import TextConfig
 
-    args = TextConfig(
+    return TextConfig(
         hidden_size=64,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -163,8 +163,39 @@ def _tiny_attention(language):
             "sparse_local_block": 1,
             "sparse_score_type": "max",
         },
+        **overrides,
     )
-    return language.MiniMaxAttention(args, 0)
+
+
+def _tiny_attention(language):
+    return language.MiniMaxAttention(_tiny_args(), 0)
+
+
+def test_long_chunk_drops_positions_that_restate_the_cache_offset(
+    language, monkeypatch
+):
+    seen = []
+    can_use = language.MiniMaxAttention._can_use_msa_prefill_attention
+
+    def spy(self, queries, keys, mask, q_positions):
+        seen.append(q_positions)
+        return can_use(self, queries, keys, mask, q_positions)
+
+    monkeypatch.setattr(
+        language.MiniMaxAttention, "_can_use_msa_prefill_attention", spy
+    )
+    mx.random.seed(5)
+    model = language.LanguageModel(
+        _tiny_args(vocab_size=97, dense_intermediate_size=32)
+    )
+    tokens = mx.random.randint(0, 97, (1, 96))
+    cache = model.make_cache()
+    model(tokens[:, :32], cache=cache)
+
+    model(tokens[:, 32:64], cache=cache, position_ids=mx.arange(32, 64)[None])
+    assert seen[-1] is None
+    model(tokens[:, 64:], cache=cache, position_ids=mx.arange(70, 102)[None])
+    assert seen[-1] is not None
 
 
 def test_left_padded_batch_decode_matches_single_rows(language):

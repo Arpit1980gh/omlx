@@ -1615,6 +1615,19 @@ class LanguageModel(nn.Module):
         base = mx.arange(cache_offset, cache_offset + seq_length, dtype=mx.int32)
         return mx.broadcast_to(base[None, :], (batch_size, seq_length))
 
+    @staticmethod
+    def _restates_cache_offset(position_ids: mx.array, cache) -> bool:
+        """True for one-row prefill positions equal to cache offset + arange."""
+        if position_ids.ndim != 2 or position_ids.shape[0] != 1:
+            return False
+        length = position_ids.shape[1]
+        offset = getattr(LanguageModel._first_cache(cache), "offset", None)
+        # Short calls (decode, verify) keep their positions and skip the host read.
+        if length <= _SPARSE_COMPACT_MAX_QUERIES or not isinstance(offset, int):
+            return False
+        expected = mx.arange(offset, offset + length, dtype=position_ids.dtype)
+        return bool(mx.array_equal(position_ids[0], expected).item())
+
     def __call__(
         self,
         inputs: mx.array,
@@ -1633,6 +1646,13 @@ class LanguageModel(nn.Module):
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         kwargs.pop("visual_pos_masks", None)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
+        if position_ids is not None and self._restates_cache_offset(
+            position_ids, cache
+        ):
+            # The VLM adapter passes offset + arange positions with every text
+            # chunk. Explicit positions keep a long chunk off the MSA prefill
+            # kernels and on the dense masked path, so drop them here.
+            position_ids = None
         if (
             mask is None
             and attention_mask is not None
