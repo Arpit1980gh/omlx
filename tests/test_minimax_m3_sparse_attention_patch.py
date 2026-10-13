@@ -285,6 +285,60 @@ def test_short_row_mxfp8_matmul_matches_one_row_decode(language, rows):
     assert mx.array_equal(qmv_rows.rows_linear(proj, x), expected).item()
 
 
+@pytest.mark.parametrize("rows", [2, 8])
+def test_row_exact_verify_router_and_mxfp8_match_one_row_decode(language, rows):
+    import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
+
+    from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
+
+    mx.random.seed(8)
+    gate = nn.Linear(6144, 128, bias=False)
+    proj = nn.QuantizedLinear.from_linear(
+        nn.Linear(512, 64, bias=False), group_size=32, bits=8, mode="mxfp8"
+    )
+    x = mx.random.normal((1, rows, 6144)).astype(mx.bfloat16)
+    small = x[..., :512]
+    expected_gates = mx.concatenate(
+        [gate(x[:, i : i + 1].astype(mx.float32)) for i in range(rows)], axis=1
+    )
+    expected_proj = mx.concatenate(
+        [proj(small[:, i : i + 1]) for i in range(rows)], axis=1
+    )
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        gates = language._router_gates(gate, x)
+        projected = qmv_rows.rows_linear(proj, small)
+        mx.eval(gates, projected)
+    finally:
+        set_verify_qmm_armed(False)
+    assert mx.array_equal(gates, expected_gates).item()
+    assert mx.array_equal(projected, expected_proj).item()
+
+
+@pytest.mark.parametrize("columns", [96, 65536])
+@pytest.mark.parametrize("rows", [2, 5, 7, 8])
+def test_row_exact_verify_affine_projection_matches_one_row_decode(
+    language, rows, columns
+):
+    import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
+
+    from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
+
+    mx.random.seed(9)
+    linear = nn.Linear(512, columns, bias=False)
+    linear.set_dtype(mx.bfloat16)
+    proj = nn.QuantizedLinear.from_linear(linear, group_size=64, bits=5)
+    x = mx.random.normal((1, rows, 512)).astype(mx.bfloat16)
+    expected = mx.concatenate([proj(x[:, i : i + 1]) for i in range(rows)], axis=1)
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        projected = qmv_rows.rows_linear(proj, x)
+        mx.eval(projected)
+    finally:
+        set_verify_qmm_armed(False)
+    assert mx.array_equal(projected, expected).item()
+
+
 @pytest.mark.parametrize("rows", [1, 4, 8])
 def test_short_row_nvfp4_experts_match_stock_switch(language, monkeypatch, rows):
     import mlx_vlm.models.minimax_m3_vl.moe_rows as moe_rows

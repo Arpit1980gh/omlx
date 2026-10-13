@@ -6,7 +6,8 @@ for every row. The kernels here keep MLX ``fp_qmv_fast``'s per-row arithmetic
 and 32-lane reduction order but convert each weight once for all rows.
 Speculative verify rows and small decode batches then match one-row decode bit
 for bit while reading the weights once. Two-row calls stay on MLX, which reads
-the weights once for them and is slightly faster there.
+the weights once for them and is slightly faster there, except inside a
+row-exact verify forward.
 """
 
 from __future__ import annotations
@@ -16,11 +17,19 @@ from functools import lru_cache
 import mlx.core as mx
 import mlx.nn as nn
 
+from omlx.patches import row_exact_qmv
+from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
+
 MIN_ROWS = 3
 MAX_ROWS = 8
 # Up to this many rows keep their inputs in registers. Longer calls read them
 # from cache inside the row loop, which avoids register spills.
 _HELD_INPUT_MAX_ROWS = 5
+# Output columns per simdgroup of the row-exact affine tile.
+_ROW_EXACT_RPS = 2
+# Projections at least this wide (the vocabulary head) share one weight pass
+# between all verify rows.
+_WIDE_OUTPUT_COLUMNS = 65536
 
 _HEADER = r"""
 inline float m31_fp8_e4m3(uint8_t bits) {
@@ -117,12 +126,16 @@ def _kernel():
 def mxfp8_rows_matmul(
     x: mx.array, weight: mx.array, scales: mx.array, quant: dict
 ) -> mx.array | None:
-    """``x @ dequantized(weight).T`` for 3-8 rows, or None when not covered."""
+    """``x @ dequantized(weight).T`` for 3-8 rows, or None when not covered.
+
+    A row-exact verify forward takes two-row calls here too.
+    """
     k = x.shape[-1]
     rows = x.size // k
     n = weight.shape[0]
+    min_rows = 2 if is_row_exact_armed() else MIN_ROWS
     if not (
-        MIN_ROWS <= rows <= MAX_ROWS
+        min_rows <= rows <= MAX_ROWS
         and quant.get("mode") == "mxfp8"
         and quant.get("bits") == 8
         and quant.get("group_size") == 32
@@ -156,11 +169,54 @@ def mxfp8_rows_matmul(
     return y.reshape(*x.shape[:-1], n)
 
 
+def _row_exact_tile(rows: int, columns: int) -> tuple[int, int]:
+    """(rows padded with zero rows, rows per threadgroup) of the affine tile.
+
+    The vocabulary head reads the most bytes, so all of its rows share one
+    weight pass. Narrower projections spill registers past five rows per tile;
+    an odd row count above that gets one padding row so it splits evenly.
+    """
+    if columns >= _WIDE_OUTPUT_COLUMNS or rows <= 5:
+        return rows, rows
+    padded = rows + rows % 2
+    return padded, next(d for d in (4, 3, 2) if padded % d == 0)
+
+
+def row_exact_linears(linears, x: mx.array) -> tuple | None:
+    """Affine projections of ``x`` in a row-exact verify forward, or None.
+
+    One launch whose threadgroups apply each weight block to several rows, so
+    the weights are read once per row group. The default row-exact route gives
+    each row its own pass at these widths, and runs a 5- or 7-row vocabulary
+    head as one-row passes.
+    """
+    rows = x.size // x.shape[-1]
+    if not (2 <= rows <= MAX_ROWS and is_row_exact_armed()):
+        return None
+    columns = sum(int(linear.weight.shape[0]) for linear in linears)
+    padded, per_group = _row_exact_tile(rows, columns)
+    flat = x.reshape(rows, x.shape[-1])
+    if padded > rows:
+        pad = mx.zeros((padded - rows, flat.shape[-1]), dtype=flat.dtype)
+        flat = mx.concatenate([flat, pad])
+    # The unrolled tile is faster where its register envelope allows it.
+    for unrolled in (True, False):
+        out = row_exact_qmv.quantized_linears_tiled(
+            linears, flat, per_group, _ROW_EXACT_RPS, unrolled
+        )
+        if out is not None:
+            return tuple(y[:rows].reshape(*x.shape[:-1], -1) for y in out)
+    return None
+
+
 def rows_linear(proj, x: mx.array) -> mx.array:
-    """Apply ``proj``, through the decode-exact kernel when it covers the call."""
+    """Apply ``proj``, through a decode-exact kernel when one covers the call."""
     if type(proj) is nn.QuantizedLinear and "bias" not in proj:
         quant = {"group_size": proj.group_size, "bits": proj.bits, "mode": proj.mode}
         y = mxfp8_rows_matmul(x, proj["weight"], proj["scales"], quant)
         if y is not None:
             return y
+        out = row_exact_linears((proj,), x)
+        if out is not None:
+            return out[0]
     return proj(x)

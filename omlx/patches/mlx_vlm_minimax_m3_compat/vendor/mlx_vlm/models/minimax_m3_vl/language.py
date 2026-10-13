@@ -8,6 +8,8 @@ from mlx_lm.models.cache import BatchKVCache, dynamic_roll
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU, SwitchLinear
 
+from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
+
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
@@ -23,7 +25,7 @@ from .msa import (
     small_l_sparse_attention,
 )
 from .moe_rows import scaled_switch_glu
-from .qmv_rows import mxfp8_rows_matmul, rows_linear
+from .qmv_rows import mxfp8_rows_matmul, row_exact_linears, rows_linear
 
 _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY = 0.5
 _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN = 32768
@@ -103,6 +105,25 @@ def _minimax_moe_select(
     weights = mx.take_along_axis(scores, inds, axis=-1)
     weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
     return inds, weights * routed_scaling_factor
+
+
+def _router_gates(gate: nn.Module, x: mx.array) -> mx.array:
+    """Router logits in float32; a row-exact verify computes them per row.
+
+    MLX runs a multi-row float32 matmul as a tiled GEMM that rounds differently
+    from the matrix-vector product of a one-token decode step. A batch of
+    ``weight @ row`` products (the weight broadcast, not copied) keeps that
+    matrix-vector kernel for every row; ``(rows, 1, K) @ weight.T`` does not,
+    because MLX folds the batch back into one GEMM.
+    """
+    x = x.astype(mx.float32)
+    rows = x.size // x.shape[-1]
+    exact = rows > 1 and is_row_exact_armed()
+    if exact and type(gate) is nn.Linear and "bias" not in gate:
+        weight = mx.broadcast_to(gate.weight, (rows, *gate.weight.shape))
+        y = weight @ x.reshape(rows, x.shape[-1], 1)
+        return y.reshape(*x.shape[:-1], -1)
+    return gate(x)
 
 
 def _row_left_padding(cache) -> Optional[mx.array]:
@@ -1166,13 +1187,22 @@ class MiniMaxAttention(nn.Module):
     def _input_projections(self, x: mx.array) -> dict:
         names = _INPUT_PROJECTIONS if self.has_sparse_index else _INPUT_PROJECTIONS[:3]
         out = {}
-        if x.shape[0] * x.shape[1] <= _FUSED_PROJECTION_MAX_ROWS:
+        rows = x.shape[0] * x.shape[1]
+        if rows <= _FUSED_PROJECTION_MAX_ROWS:
             fused = self.__dict__.get("_omlx_fused_projections")
             if fused is None or not all(group.current(self) for group in fused):
                 fused = _fuse_projections(self, names)
                 self.__dict__["_omlx_fused_projections"] = fused
+            # A row-exact verify runs the MXFP8 group on the decode-exact rows
+            # kernel and an affine group on the row-exact affine tile.
+            exact = rows > 1 and is_row_exact_armed()
             for group in fused:
-                out.update(group(x))
+                if not exact or group.quant["mode"] == "mxfp8":
+                    out.update(group(x))
+                    continue
+                projected = row_exact_linears([self[n] for n in group.names], x)
+                if projected is not None:
+                    out.update(zip(group.names, projected))
         for name in names:
             if name not in out:
                 out[name] = self[name](x)
@@ -1397,7 +1427,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
-        gates = self.gate(x.astype(mx.float32))
+        gates = _router_gates(self.gate, x)
         if self.e_score_correction_bias is not None:
             inds, scores = _minimax_moe_select(
                 gates,
@@ -1528,6 +1558,10 @@ class MiniMaxM3Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    # Single-row verify forwards reproduce one-token decode arithmetic, so
+    # greedy speculative output equals plain decode output.
+    _omlx_mtp_row_exact_verify = True
+
     def __init__(self, args: TextConfig, config: Optional[ModelConfig] = None):
         super().__init__()
         self.args = args
@@ -1762,7 +1796,7 @@ class LanguageModel(nn.Module):
     def logits_from_hidden(self, hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden)
-        return self.lm_head(hidden)
+        return rows_linear(self.lm_head, hidden)
 
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
         return self.logits_from_hidden(self.model.norm(hidden))
