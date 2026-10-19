@@ -6,7 +6,9 @@ for every row. ``exact_rows_qmv`` keeps MLX ``fp_qmv_fast``'s per-row
 arithmetic and 32-lane reduction order but reads each weight once for all
 rows, so speculative verify rows and small decode batches match one-row decode
 bit for bit. Two-row calls stay on MLX, which reads the weights once for them
-and is slightly faster there, except inside a row-exact verify forward.
+and is slightly faster there, except inside a row-exact verify forward. A
+row-exact verify also runs the base checkpoint's BF16 vocabulary head through
+``exact_verify_gemv``, MLX's one-row GEMV with every row sharing a weight load.
 """
 
 from __future__ import annotations
@@ -15,7 +17,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from omlx.patches import row_exact_qmv
-from omlx.patches.deepseek_v4.verify_qmv import exact_rows_qmv
+from omlx.patches.deepseek_v4.verify_qmv import (
+    dense_eligible,
+    exact_rows_qmv,
+    exact_verify_gemv,
+)
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
 MIN_ROWS = 3
@@ -117,4 +123,10 @@ def rows_linear(proj, x: mx.array) -> mx.array:
         out = row_exact_linears((proj,), x)
         if out is not None:
             return out[0]
+    elif (
+        type(proj) is nn.Linear
+        and is_row_exact_armed()
+        and dense_eligible(proj, x, max_rows=MAX_ROWS)
+    ):
+        return exact_verify_gemv(proj, x)
     return proj(x)

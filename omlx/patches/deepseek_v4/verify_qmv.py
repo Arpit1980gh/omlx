@@ -9,7 +9,7 @@ weight byte across all verify rows before advancing K.  That makes M=2..6
 bitwise equivalent to M independent decode calls without streaming the weight
 matrix M times.  Six rows cover DSpark's five-draft verification block.
 MiniMax M3 runs MXFP8 verify blocks of up to eight rows through
-``exact_rows_qmv``.
+``exact_rows_qmv`` and its BF16 vocabulary head through ``exact_verify_gemv``.
 """
 
 from __future__ import annotations
@@ -545,7 +545,7 @@ def exact_verify_multi_qmv(module, inputs: mx.array) -> mx.array:
     return output
 
 
-def dense_eligible(module, inputs: mx.array) -> bool:
+def dense_eligible(module, inputs: mx.array, max_rows: int = 6) -> bool:
     """Return whether a dense linear has MLX's large-output GEMV geometry."""
     if inputs.ndim < 2 or module.weight.ndim != 2:
         return False
@@ -553,7 +553,7 @@ def dense_eligible(module, inputs: mx.array) -> bool:
     rows = int(inputs.size) // input_dims
     output_dims = int(module.weight.shape[0])
     return (
-        2 <= rows <= 6
+        2 <= rows <= max_rows
         and inputs.dtype in (mx.bfloat16, mx.float16)
         and module.weight.dtype == inputs.dtype
         and input_dims % 128 == 0

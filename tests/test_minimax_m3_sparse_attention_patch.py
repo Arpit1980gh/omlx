@@ -316,6 +316,26 @@ def test_row_exact_verify_router_and_mxfp8_match_one_row_decode(language):
     assert mx.array_equal(projected, expected_proj).item()
 
 
+@pytest.mark.parametrize("rows", [2, 8])
+def test_row_exact_verify_dense_head_matches_one_row_decode(language, rows):
+    import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
+
+    from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
+
+    mx.random.seed(10)
+    head = nn.Linear(6144, 4096, bias=False)
+    head.set_dtype(mx.bfloat16)
+    x = mx.random.normal((1, rows, 6144)).astype(mx.bfloat16)
+    expected = mx.concatenate([head(x[:, i : i + 1]) for i in range(rows)], axis=1)
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        projected = qmv_rows.rows_linear(head, x)
+        mx.eval(projected)
+    finally:
+        set_verify_qmm_armed(False)
+    assert mx.array_equal(projected, expected).item()
+
+
 @pytest.mark.parametrize("prompt", [30, 60])
 def test_row_exact_verify_attention_matches_one_row_decode(language, prompt):
     """Six verify rows of 16 query heads per KV head exceed MLX's vector SDPA
