@@ -186,9 +186,7 @@ def row_exact_linears(linears, x: mx.array) -> tuple | None:
     """Affine projections of ``x`` in a row-exact verify forward, or None.
 
     One launch whose threadgroups apply each weight block to several rows, so
-    the weights are read once per row group. The default row-exact route gives
-    each row its own pass at these widths, and runs a 5- or 7-row vocabulary
-    head as one-row passes.
+    the weights are read once per row group instead of once per row.
     """
     rows = x.size // x.shape[-1]
     if not (2 <= rows <= MAX_ROWS and is_row_exact_armed()):

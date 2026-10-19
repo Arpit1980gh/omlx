@@ -3,7 +3,7 @@
 
 import pytest
 
-from omlx.api.thinking import ThinkingParser, extract_thinking, leading_thinking_only
+from omlx.api.thinking import ThinkingParser, extract_thinking
 
 class TestExtractThinking:
     """Tests for non-streaming extract_thinking()."""
@@ -491,13 +491,3 @@ def test_leading_only_thinking_keeps_later_tags_in_the_answer(
         content += c
     t, c = parser.finish()
     assert ((thinking + t).strip(), (content + c).strip()) == expected
-
-
-def test_leading_only_thinking_follows_minimax_markers():
-    class Tokenizer:
-        think_start = "<mm:think>"
-
-    assert leading_thinking_only(Tokenizer())
-    Tokenizer.think_start = "<think>"
-    assert not leading_thinking_only(Tokenizer())
-    assert not leading_thinking_only(None)

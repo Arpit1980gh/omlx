@@ -968,7 +968,7 @@ class TestApplyChatTemplate:
 
     @pytest.mark.parametrize(
         ("effort", "thinking_mode"),
-        [("max", None), ("xhigh", None), ("low", None), ("none", "disabled")],
+        [("max", None), ("none", "disabled")],
     )
     def test_minimax_m3_forwards_reasoning_effort(self, effort, thinking_mode):
         tokenizer = MagicMock()

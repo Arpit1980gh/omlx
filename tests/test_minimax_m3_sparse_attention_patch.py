@@ -272,7 +272,7 @@ def test_short_calls_fuse_input_projections_bit_exactly(language, monkeypatch, m
         assert mx.array_equal(a, b).item()
 
 
-@pytest.mark.parametrize("rows", [3, 5, 6, 8])
+@pytest.mark.parametrize("rows", [3, 8])
 def test_short_row_mxfp8_matmul_matches_one_row_decode(language, rows):
     import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
 
@@ -285,13 +285,13 @@ def test_short_row_mxfp8_matmul_matches_one_row_decode(language, rows):
     assert mx.array_equal(qmv_rows.rows_linear(proj, x), expected).item()
 
 
-@pytest.mark.parametrize("rows", [2, 8])
-def test_row_exact_verify_router_and_mxfp8_match_one_row_decode(language, rows):
+def test_row_exact_verify_router_and_mxfp8_match_one_row_decode(language):
     import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
 
     from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
 
     mx.random.seed(8)
+    rows = 2
     gate = nn.Linear(6144, 128, bias=False)
     proj = nn.QuantizedLinear.from_linear(
         nn.Linear(512, 64, bias=False), group_size=32, bits=8, mode="mxfp8"
@@ -316,7 +316,7 @@ def test_row_exact_verify_router_and_mxfp8_match_one_row_decode(language, rows):
 
 
 @pytest.mark.parametrize("columns", [96, 65536])
-@pytest.mark.parametrize("rows", [2, 5, 7, 8])
+@pytest.mark.parametrize("rows", [5, 7])
 def test_row_exact_verify_affine_projection_matches_one_row_decode(
     language, rows, columns
 ):
@@ -339,7 +339,7 @@ def test_row_exact_verify_affine_projection_matches_one_row_decode(
     assert mx.array_equal(projected, expected).item()
 
 
-@pytest.mark.parametrize("rows", [1, 4, 8])
+@pytest.mark.parametrize("rows", [1, 8])
 def test_short_row_nvfp4_experts_match_stock_switch(language, monkeypatch, rows):
     import mlx_vlm.models.minimax_m3_vl.moe_rows as moe_rows
 

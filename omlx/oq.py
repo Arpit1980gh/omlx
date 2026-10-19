@@ -1231,8 +1231,9 @@ def _build_quant_plan(
     fixed_overrides = fixed_overrides or {}
 
     # GLM DSA and MiniMax indexers are a format invariant, not an optional
-    # sensitivity boost. Seed them before pricing the plan and never let the bpw cap drop
-    # them. On GLM-5.2 all 22 indexers together are only about 209 MiB at Q8.
+    # sensitivity boost. Seed them before pricing the plan and never let the
+    # bpw cap drop them. On GLM-5.2 all 22 indexers together are only about
+    # 209 MiB at Q8.
     for path in named_shapes:
         if path in fixed_overrides:
             continue

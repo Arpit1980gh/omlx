@@ -339,9 +339,8 @@ class ThinkingParser:
                 # Check if this could be a tag start
                 remaining = text[i:]
 
-                # Leading-only output opens its block before any text; the
-                # scheduler's prefix for a prompt-opened block is the case
-                # where the parser already starts in thinking.
+                # Leading-only output opens its block only before any text,
+                # which also takes the scheduler's prefix of a prompt-opened block.
                 can_open = not self._leading_only or not self._text_seen
                 # Try to match <think>
                 if can_open and remaining.startswith(_OPEN_TAG):

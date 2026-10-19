@@ -727,8 +727,6 @@ class DFlashDrafter:
                 axis=2,
             )[:, None]
         elif self.query_windows:
-            # Query j sits at totals + j and attends the context from
-            # totals + j - slots on, plus the whole block.
             lower = totals[:, None] + mx.arange(block, dtype=mx.int32) - slots
             windowed = (
                 (pos[:, None, :] >= 0)
