@@ -9,6 +9,7 @@ from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU, SwitchLinear
 
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
+from omlx.patches.qwen35_verify_sdpa_split import row_exact_causal_sdpa
 
 from ..base import (
     LanguageModelOutput,
@@ -17,6 +18,7 @@ from ..base import (
 )
 from ..cache import KVCache
 from .config import ModelConfig, TextConfig
+from .moe_rows import scaled_switch_glu
 from .msa import (
     build_grouped_msa_topk,
     build_grouped_msa_topk_blockwise,
@@ -24,7 +26,6 @@ from .msa import (
     small_l_block_scores,
     small_l_sparse_attention,
 )
-from .moe_rows import scaled_switch_glu
 from .qmv_rows import mxfp8_rows_matmul, row_exact_linears, rows_linear
 
 _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY = 0.5
@@ -33,6 +34,8 @@ _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK = 2
 # Up to this many query tokens (decode, speculative verify) gather their
 # selected blocks; longer chunks use one sparse keep-mask per KV head.
 _SPARSE_COMPACT_MAX_QUERIES = 16
+# Query rows x GQA factor one MLX vector SDPA call holds.
+_VECTOR_SDPA_ROWS = 32
 # Projections of the attention input that short calls run as one matmul.
 _INPUT_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "index_q_proj", "index_k_proj")
 # MLX runs calls this short as matrix-vector products that compute every
@@ -1274,7 +1277,10 @@ class MiniMaxAttention(nn.Module):
             mask = self._normalize_attention_mask(
                 mask, B, L, keys.shape[2], causal=sparse_q_positions is None
             )
-            if idx_keys.shape[2] > self.sparse_block_size * self.sparse_topk_blocks:
+            # Up to topk blocks the selection keeps every block, so dense
+            # attention gives the same result faster.
+            dense_keys = self.sparse_block_size * self.sparse_topk_blocks
+            if idx_keys.shape[2] > dense_keys:
                 left_padding = _row_left_padding(cache)
                 # Short calls (decode, speculative verify) stay on the compact
                 # path so a verify row computes exactly like a decode step.
@@ -1333,6 +1339,16 @@ class MiniMaxAttention(nn.Module):
                     output = small_l_sparse_attention(*sparse_args)
                     if output is None:
                         output = _compact_sparse_attention(*sparse_args)
+                    # Leading verify rows whose decode step saw at most
+                    # dense_keys keys took the dense path there.
+                    dense_rows = dense_keys - (idx_keys.shape[2] - L)
+                    if dense_rows > 0 and is_row_exact_armed():
+                        dense = self._row_exact_attention(
+                            queries, keys, values, mask, dense_rows
+                        )
+                        output = mx.concatenate(
+                            [dense, output[:, :, dense_rows:]], axis=2
+                        )
                 else:
                     token_mask = _sparse_token_mask(
                         block_ids,
@@ -1351,11 +1367,34 @@ class MiniMaxAttention(nn.Module):
                 mask, B, L, keys.shape[2], causal=True
             )
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+        if L > 1 and is_row_exact_armed():
+            output = self._row_exact_attention(queries, keys, values, mask, L)
+        else:
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return rows_linear(self.o_proj, output)
+
+    def _row_exact_attention(self, queries, keys, values, mask, rows: int):
+        """Dense attention of the first ``rows`` query rows, each computed like
+        its own one-row decode step.
+
+        MLX picks another kernel once a call holds more query rows than its
+        vector kernel takes, and that kernel rounds differently.
+        """
+        kv_len = keys.shape[2] - (queries.shape[2] - rows)
+        if isinstance(mask, mx.array):
+            mask = mask[..., :rows, :kv_len]
+        group = self.num_attention_heads // self.num_key_value_heads
+        return row_exact_causal_sdpa(
+            queries[:, :, :rows],
+            keys[:, :, :kv_len],
+            values[:, :, :kv_len],
+            self.scale,
+            max(1, _VECTOR_SDPA_ROWS // group),
+            mask=mask,
+        )
 
 
 class MiniMaxSparseMoeBlock(nn.Module):

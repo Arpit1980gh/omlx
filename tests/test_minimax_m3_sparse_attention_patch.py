@@ -142,10 +142,10 @@ def test_compact_and_masked_paths_match_reference(language):
     np.testing.assert_allclose(np.array(masked), expected, atol=1e-5)
 
 
-def _tiny_args(**overrides):
+def _tiny_args(sparse=None, **overrides):
     from mlx_vlm.models.minimax_m3_vl.config import TextConfig
 
-    return TextConfig(
+    fields = dict(
         hidden_size=64,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -162,9 +162,10 @@ def _tiny_args(**overrides):
             "sparse_init_block": 0,
             "sparse_local_block": 1,
             "sparse_score_type": "max",
+            **(sparse or {}),
         },
-        **overrides,
     )
+    return TextConfig(**{**fields, **overrides})
 
 
 def _tiny_attention(language):
@@ -313,6 +314,51 @@ def test_row_exact_verify_router_and_mxfp8_match_one_row_decode(language):
         set_verify_qmm_armed(False)
     assert mx.array_equal(gates, expected_gates).item()
     assert mx.array_equal(projected, expected_proj).item()
+
+
+@pytest.mark.parametrize("prompt", [30, 60])
+def test_row_exact_verify_attention_matches_one_row_decode(language, prompt):
+    """Six verify rows of 16 query heads per KV head exceed MLX's vector SDPA
+    rows. Up to 64 keys the attention is dense; a 60-token prompt puts the
+    verify across that threshold. Quantized projections keep the projections
+    row-exact, so only the attention can differ."""
+    from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
+
+    mx.random.seed(1)
+    args = _tiny_args(
+        sparse={"sparse_block_size": 32, "sparse_index_dim": 64},
+        hidden_size=512,
+        num_attention_heads=32,
+        head_dim=64,
+    )
+    attention = language.MiniMaxAttention(args, 0)
+    attention.set_dtype(mx.bfloat16)
+    nn.quantize(attention, group_size=64, bits=8)
+    rows = 6
+    x = mx.random.normal((1, prompt + rows, 512)).astype(mx.bfloat16)
+    cache = language.MiniMaxM3KVCache()
+    attention(x[:, :prompt], mask="causal", cache=cache)
+    steps = [
+        attention(
+            x[:, prompt + i : prompt + i + 1],
+            cache=cache,
+            position_ids=mx.array([[prompt + i]]),
+        )
+        for i in range(rows)
+    ]
+    cache.trim(rows)
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        verify = attention(
+            x[:, prompt:],
+            mask="causal",
+            cache=cache,
+            position_ids=mx.arange(prompt, prompt + rows)[None],
+        )
+        mx.eval(verify)
+    finally:
+        set_verify_qmm_armed(False)
+    assert mx.array_equal(verify, mx.concatenate(steps, axis=1)).item()
 
 
 @pytest.mark.parametrize("columns", [96, 65536])
