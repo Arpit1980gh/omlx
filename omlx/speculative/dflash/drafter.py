@@ -510,8 +510,7 @@ class DFlashDrafter:
 
     def extend_context(self, state, captured) -> None:
         """Queue committed rows as context without drafting a block."""
-        if captured:
-            self._queue(self._row(state.uid), _concat_captured(captured))
+        self.seed(state.uid, captured)
 
     def adopt_predraft(self, state, count: int) -> None:
         """Commit the queued block: ``count`` verify rows entered the context."""
