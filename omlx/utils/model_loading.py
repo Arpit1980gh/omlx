@@ -929,7 +929,6 @@ def maybe_apply_pre_load_patches(
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
     ):
         from ..patches.minimax_m3_dspark import (
-            MiniMaxDSparkConfig,
             bundled_dspark_path,
             install_minimax_dspark_runtime,
         )
@@ -959,14 +958,7 @@ def maybe_apply_pre_load_patches(
             # bf16 tail-ULP level.
             depth = getattr(model_settings, "mtp_adaptive_max_depth", None)
             fixed = getattr(model_settings, "mtp_fixed_depth", None)
-            if minimax_dspark is not None:
-                # The bundled DSpark draft proposes its trained block; the
-                # depth controller verifies the profitable prefix of it.
-                block = MiniMaxDSparkConfig.from_dict(
-                    json.loads((minimax_dspark / "config.json").read_text())
-                ).block_size
-                set_mtp_depth(int(fixed or block), fixed=bool(fixed))
-            elif fixed:
+            if fixed:
                 set_mtp_depth(int(fixed), fixed=True)
             elif (
                 model_type == "qwen3_5"

@@ -889,7 +889,7 @@ def test_verify_mode_selects_adaptive_depth():
     assert ModelSettings(dflash_verify_mode="ddtree").dflash_verify_mode == "adaptive"
 
 
-def _tiny_minimax_dspark(seed=0):
+def _tiny_minimax_dspark(seed=0, depth=None, fixed=False):
     from omlx.patches.minimax_m3_dspark import (
         MiniMaxDSparkConfig,
         MiniMaxDSparkDraftModel,
@@ -925,7 +925,7 @@ def _tiny_minimax_dspark(seed=0):
     model.load_weights(list(params.items()), strict=True)
     model.bind(_tiny_target())
     mx.eval(model.parameters())
-    return wrap_minimax_dspark(model, "tiny")
+    return wrap_minimax_dspark(model, "tiny", depth, fixed)
 
 
 def _reference_minimax_dspark(model, context, anchor):
@@ -1066,6 +1066,21 @@ def test_dspark_context_only_cycle_keeps_the_next_block():
     copying.draft([(None, after_copy, second, anchors[1], None)])
 
     assert after_copy.drafts.tolist() == every_cycle.drafts.tolist()
+
+
+def test_minimax_dspark_depth_verifies_a_prefix_of_the_trained_block():
+    """A depth setting caps the proposals, not the block they are drafted in."""
+    captured, anchor = _captured(5, seed=33), mx.array([7], dtype=mx.uint32)
+    full = _tiny_minimax_dspark()
+    capped = _tiny_minimax_dspark(depth=2, fixed=True)
+    assert capped.block_size == full.block_size and not capped.adaptive
+
+    states = []
+    for drafter in (full, capped):
+        state = SimpleNamespace(uid=0, depth=BLOCK, controller=None)
+        drafter.draft([(None, state, captured, anchor, None)])
+        states.append(state)
+    assert states[1].drafts.tolist() == states[0].drafts.tolist()[:2]
 
 
 def test_dspark_context_only_cycles_queue_at_most_one_ring():

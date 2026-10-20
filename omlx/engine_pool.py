@@ -4261,6 +4261,8 @@ class EnginePool:
                 )
 
                 dspark_path = bundled_dspark_path(entry.model_path)
+                fixed = getattr(model_settings, "mtp_fixed_depth", None)
+                depth = fixed or getattr(model_settings, "mtp_adaptive_max_depth", None)
                 if dspark_path is not None:
                     try:
                         drafter = await asyncio.get_running_loop().run_in_executor(
@@ -4268,6 +4270,8 @@ class EnginePool:
                             load_minimax_dspark_drafter,
                             dspark_path,
                             engine.vlm_model,
+                            depth,
+                            bool(fixed),
                         )
                     except Exception as e:
                         logger.warning(

@@ -272,8 +272,18 @@ def load_minimax_dspark_model(path: str | Path) -> MiniMaxDSparkDraftModel:
     return model
 
 
-def wrap_minimax_dspark(model: MiniMaxDSparkDraftModel, source_path: str):
-    """Wrap a bound MiniMax DSpark draft model for the batched verify path."""
+def wrap_minimax_dspark(
+    model: MiniMaxDSparkDraftModel,
+    source_path: str,
+    depth: int | None = None,
+    fixed: bool = False,
+):
+    """Wrap a bound MiniMax DSpark draft model for the batched verify path.
+
+    ``depth`` caps the drafts a cycle verifies, exactly that many when
+    ``fixed``. The block stays the trained one: its rows attend each other
+    both ways, so a shorter block would change the leading proposals too.
+    """
     from ..speculative.dflash import DFlashDrafter
 
     # The drafter's DSpark layout is the anchor plus block_size - 2 masks;
@@ -282,8 +292,10 @@ def wrap_minimax_dspark(model: MiniMaxDSparkDraftModel, source_path: str):
         model,
         block_size=model.config.block_size + 1,
         source_path=source_path,
-        adaptive=True,
+        adaptive=not fixed,
     )
+    if depth:
+        drafter.depth = max(1, min(drafter.depth, int(depth)))
     # MiniMax batch caches trim every row by the same amount, so rows with
     # different acceptance verify against their own extracted caches.
     drafter.independent_verify = True
@@ -292,15 +304,22 @@ def wrap_minimax_dspark(model: MiniMaxDSparkDraftModel, source_path: str):
     return drafter
 
 
-def load_minimax_dspark_drafter(path: str | Path, target_model: Any):
+def load_minimax_dspark_drafter(
+    path: str | Path,
+    target_model: Any,
+    depth: int | None = None,
+    fixed: bool = False,
+):
     """Load the bundled draft and wrap it for the batched verify path."""
     model = load_minimax_dspark_model(path).bind(target_model)
-    drafter = wrap_minimax_dspark(model, str(path))
+    drafter = wrap_minimax_dspark(model, str(path), depth, fixed)
     logger.info(
-        "MiniMax DSpark drafter loaded: path=%s block=%d depth=%d target_layers=%s",
+        "MiniMax DSpark drafter loaded: path=%s block=%d depth=%d adaptive=%s "
+        "target_layers=%s",
         path,
         drafter.block_size,
         drafter.depth,
+        drafter.adaptive,
         drafter.target_layer_ids,
     )
     return drafter
