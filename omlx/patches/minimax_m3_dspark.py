@@ -15,8 +15,9 @@ target weights. The draft is a five-layer DFlash-style block model:
   the previous token before each proposal is sampled.
 
 The draft runs on the batched block-drafter path in
-:mod:`omlx.speculative.dflash`; this module provides the model, its
-checkpoint loader and the target-side hooks that path needs.
+:mod:`omlx.speculative.dflash`; this module provides the model and its
+checkpoint loader. The target-side hooks live in the vendored MiniMax
+language model.
 """
 
 from __future__ import annotations
@@ -147,7 +148,6 @@ class MiniMaxDSparkAttention(nn.Module):
         self.n_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.scale = config.head_dim**-0.5
-        self.attention_sink_bias = None
         hidden = config.hidden_size
         self.q_proj = nn.Linear(hidden, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(hidden, self.n_kv_heads * self.head_dim, bias=False)
@@ -155,9 +155,6 @@ class MiniMaxDSparkAttention(nn.Module):
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, hidden, bias=False)
         self.q_norm = language.MiniMaxRMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = language.MiniMaxRMSNorm(self.head_dim, config.rms_norm_eps)
-
-    def _project_kv(self, x: mx.array) -> tuple[mx.array, mx.array]:
-        return self.k_proj(x), self.v_proj(x)
 
 
 class MiniMaxDSparkLayer(nn.Module):
@@ -323,78 +320,3 @@ def load_minimax_dspark_drafter(
         drafter.target_layer_ids,
     )
     return drafter
-
-
-_RUNTIME_MARKER = "_omlx_minimax_dspark_runtime"
-
-
-def install_minimax_dspark_runtime() -> bool:
-    """Give the vendored MiniMax language model the block-drafter hooks.
-
-    - A verify forward (``return_hidden=True``) returns the requested layer
-      captures in request order followed by the last layer's hidden state.
-    - A plain one-token decode step inside a drafter scope captures the
-      drafter layers so the committed token enters its context.
-    - ``mtp_partial_rollback`` trims rejected draft positions from every
-      layer cache.
-    """
-    language = _vendored_language()
-    cls = language.LanguageModel
-    if getattr(cls, _RUNTIME_MARKER, False):
-        return False
-    original_call = cls.__call__
-
-    def patched_call(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
-        kwargs.pop("n_confirmed", None)
-        if not kwargs.pop("return_hidden", False):
-            drafter = getattr(self, "_omlx_drafter", None)
-            scope = getattr(drafter, "scope_uids", None)
-            if (
-                scope
-                and inputs is not None
-                and inputs.ndim == 2
-                and inputs.shape == (len(scope), 1)
-                and kwargs.get("capture_layer_ids") is None
-            ):
-                out = original_call(
-                    self,
-                    inputs,
-                    inputs_embeds,
-                    mask,
-                    cache,
-                    capture_layer_ids=list(drafter.target_layer_ids),
-                    **kwargs,
-                )
-                drafter.observe(scope, out.hidden_states)
-                return out
-            return original_call(self, inputs, inputs_embeds, mask, cache, **kwargs)
-
-        requested = list(kwargs.pop("capture_layer_ids", None) or [])
-        last = len(self.model.layers) - 1
-        layers = sorted({*requested, last})
-        out = original_call(
-            self, inputs, inputs_embeds, mask, cache, capture_layer_ids=layers, **kwargs
-        )
-        by_layer = dict(zip(layers, out.hidden_states))
-        return language.LanguageModelOutput(
-            logits=out.logits,
-            hidden_states=[by_layer[i] for i in requested] + [by_layer[last]],
-            gdn_states=None,
-            shared_kv_states=out.shared_kv_states,
-        )
-
-    def mtp_partial_rollback(self, prompt_cache, accepted: int, num_drafts: int):
-        rejected = int(num_drafts) - int(accepted)
-        if rejected <= 0:
-            return True
-        if not all(c.is_trimmable() for c in prompt_cache if c is not None):
-            return False
-        for c in prompt_cache:
-            if c is not None:
-                c.trim(rejected)
-        return True
-
-    cls.__call__ = patched_call
-    cls.mtp_partial_rollback = mtp_partial_rollback
-    setattr(cls, _RUNTIME_MARKER, True)
-    return True

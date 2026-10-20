@@ -6,7 +6,12 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx_lm.models.cache import BatchKVCache, dynamic_roll
 from mlx_lm.models.rope_utils import initialize_rope
-from mlx_lm.models.switch_layers import SwitchGLU, SwitchLinear
+from mlx_lm.models.switch_layers import (
+    SwitchGLU,
+    SwitchLinear,
+    _gather_sort,
+    _scatter_unsort,
+)
 
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 from omlx.patches.qwen35_verify_sdpa_split import row_exact_causal_sdpa
@@ -21,7 +26,7 @@ from .config import ModelConfig, TextConfig
 from .moe_rows import scaled_switch_glu
 from .msa import (
     build_grouped_msa_topk,
-    build_grouped_msa_topk_blockwise,
+    msa_prefill_supported,
     msa_sparse_attention_b1,
     small_l_block_scores,
     small_l_sparse_attention,
@@ -72,21 +77,6 @@ def _is_empty_kv_state(state) -> bool:
         and state[0] is None
         and state[1] is None
     )
-
-
-def _switch_gather_sort(x: mx.array, indices: mx.array):
-    *_, num_selected = indices.shape
-    indices = indices.flatten()
-    order = mx.argsort(indices)
-    inv_order = mx.argsort(order)
-    return x.flatten(0, -3)[order // num_selected], indices[order], inv_order
-
-
-def _switch_scatter_unsort(x: mx.array, inv_order: mx.array, shape=None):
-    x = x[inv_order]
-    if shape is not None:
-        x = mx.unflatten(x, 0, shape)
-    return x
 
 
 @mx.compile
@@ -358,20 +348,6 @@ def _combine_routed(y: mx.array, weights: mx.array) -> mx.array:
 
 
 @partial(mx.compile, shapeless=True)
-def _swiglu_oai(
-    x_linear,
-    x_glu,
-    alpha: float = 1.702,
-    limit: float = 7.0,
-    beta: float = 1.0,
-):
-    dtype = x_linear.dtype
-    x_glu = mx.clip(x_glu.astype(mx.float32), a_min=None, a_max=limit)
-    x_linear = mx.clip(x_linear.astype(mx.float32), a_min=-limit, a_max=limit)
-    return (x_glu * mx.sigmoid(alpha * x_glu) * (x_linear + beta)).astype(dtype)
-
-
-@partial(mx.compile, shapeless=True)
 def _scaled_swiglu_oai(
     x_linear,
     x_glu,
@@ -404,7 +380,7 @@ class MiniMaxSwiGLUOAI(nn.Module):
         self.beta = beta
 
     def __call__(self, x, gate):
-        return _swiglu_oai(x, gate, self.alpha, self.limit, self.beta)
+        return _scaled_swiglu_oai(x, gate, 1.0, 1.0, self.alpha, self.limit, self.beta)
 
 
 class MiniMaxRMSNorm(nn.Module):
@@ -818,7 +794,7 @@ class MiniMaxPackedSwitchGLU(nn.Module):
         idx = indices
         inv_order = None
         if do_sort:
-            x, idx, inv_order = _switch_gather_sort(x, indices)
+            x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
 
@@ -831,7 +807,7 @@ class MiniMaxPackedSwitchGLU(nn.Module):
         )
 
         if do_sort:
-            x = _switch_scatter_unsort(x, inv_order, indices.shape)
+            x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
 
@@ -867,7 +843,7 @@ class MiniMaxScaledSwitchGLU(SwitchGLU):
         idx = indices
         inv_order = None
         if do_sort:
-            x, idx, inv_order = _switch_gather_sort(x, indices)
+            x, idx, inv_order = _gather_sort(x, indices)
 
         x_up = self.up_proj(x, idx, sorted_indices=do_sort)
         x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
@@ -887,7 +863,7 @@ class MiniMaxScaledSwitchGLU(SwitchGLU):
         )
 
         if do_sort:
-            x = _switch_scatter_unsort(x, inv_order, indices.shape)
+            x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
 
@@ -1128,12 +1104,12 @@ class MiniMaxAttention(nn.Module):
             mx.metal.is_available()
             and self.sparse_score_type == "max"
             and B == 1
-            and L > 1
+            and L >= 8
             and q_positions is None
             and (mask is None or isinstance(mask, str))
             and self.index_heads == K
             and H % K == 0
-            and D % 32 == 0
+            and msa_prefill_supported(D, self.sparse_block_size, H // K)
             and num_blocks >= self.sparse_topk_blocks
             and sparse_density < _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY
         )
@@ -1154,13 +1130,7 @@ class MiniMaxAttention(nn.Module):
         ):
             return None
 
-        topk_builder = build_grouped_msa_topk
-        builder_kwargs = {}
-        if idx_keys.shape[2] >= _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN:
-            topk_builder = build_grouped_msa_topk_blockwise
-            builder_kwargs["block_chunk_size"] = _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK
-
-        q2k = topk_builder(
+        q2k = build_grouped_msa_topk(
             idx_queries,
             idx_keys,
             q_start,
@@ -1169,7 +1139,11 @@ class MiniMaxAttention(nn.Module):
             self.sparse_topk_blocks,
             self.sparse_init_blocks,
             self.sparse_local_blocks,
-            **builder_kwargs,
+            block_chunk_size=(
+                _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK
+                if idx_keys.shape[2] >= _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN
+                else None
+            ),
         )[0]
         q = queries[0].transpose(1, 0, 2)
         k = keys[0].transpose(1, 0, 2)
@@ -1467,31 +1441,18 @@ class MiniMaxSparseMoeBlock(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         gates = _router_gates(self.gate, x)
-        if self.e_score_correction_bias is not None:
-            inds, scores = _minimax_moe_select(
-                gates,
-                self.e_score_correction_bias,
-                self.num_experts_per_tok,
-                self.routed_scaling_factor,
-                self.scoring_func,
-            )
-            if self.routed_expert_scales:
-                # The down projection output is still scaled by the expert's
-                # NVFP4 global scale. Fold its inverse into the routing weight.
-                scores = scores * self.switch_mlp.down_scale[inds]
-        else:
-            if self.scoring_func == "sigmoid":
-                scores = mx.sigmoid(gates)
-            else:
-                scores = mx.softmax(gates, axis=-1, precise=True)
-
-            k = self.num_experts_per_tok
-            inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-            scores = mx.take_along_axis(scores, inds, axis=-1)
-            scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
-            scores = scores * self.routed_scaling_factor
-            if self.routed_expert_scales:
-                scores = scores * self.switch_mlp.down_scale[inds]
+        bias = self.e_score_correction_bias
+        inds, scores = _minimax_moe_select(
+            gates,
+            mx.zeros((1,), dtype=mx.float32) if bias is None else bias,
+            self.num_experts_per_tok,
+            self.routed_scaling_factor,
+            self.scoring_func,
+        )
+        if self.routed_expert_scales:
+            # The down projection output is still scaled by the expert's
+            # NVFP4 global scale. Fold its inverse into the routing weight.
+            scores = scores * self.switch_mlp.down_scale[inds]
         if self.pack_shared_expert:
             shared_inds = mx.full(
                 (*inds.shape[:-1], 1), self.shared_expert_index, dtype=inds.dtype
@@ -1809,9 +1770,28 @@ class LanguageModel(nn.Module):
                     position_ids = self._offset_position_ids(
                         delta, batch_size, seq_length
                     )
+        observing = None
+        if return_hidden:
+            # A verify forward returns the requested layer captures in request
+            # order, then the last layer's hidden state.
+            requested = list(capture_layer_ids or [])
+            last = len(self.model.layers) - 1
+            capture_layer_ids = sorted({*requested, last})
+        else:
+            # A one-token decode step inside a block drafter's scope captures
+            # the drafter layers so the committed token enters its context.
+            drafter = getattr(self, "_omlx_drafter", None)
+            scope = getattr(drafter, "scope_uids", None)
+            if (
+                scope
+                and capture_layer_ids is None
+                and inputs is not None
+                and inputs.shape == (len(scope), 1)
+            ):
+                capture_layer_ids = list(drafter.target_layer_ids)
+                observing = scope
         hidden_sink = kwargs.pop(
-            "hidden_sink",
-            [] if capture_layer_ids is not None or return_hidden else None,
+            "hidden_sink", [] if capture_layer_ids is not None else None
         )
 
         out = self.model(
@@ -1825,12 +1805,27 @@ class LanguageModel(nn.Module):
         )
 
         logits = self.logits_from_hidden(out) if skip_logits is False else None
+        hidden_states = hidden_sink
+        if return_hidden:
+            by_layer = dict(zip(capture_layer_ids, hidden_sink))
+            hidden_states = [by_layer[i] for i in requested] + [by_layer[last]]
+        elif observing is not None:
+            drafter.observe(observing, hidden_sink)
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=hidden_sink,
+            hidden_states=hidden_states,
             gdn_states=None,
             shared_kv_states={} if return_shared_kv else None,
         )
+
+    def mtp_partial_rollback(self, prompt_cache, accepted: int, num_drafts: int):
+        """Trim the rejected draft positions from every layer cache."""
+        rejected = int(num_drafts) - int(accepted)
+        if rejected > 0:
+            for cache in prompt_cache:
+                if cache is not None:
+                    cache.trim(rejected)
+        return True
 
     def logits_from_hidden(self, hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:

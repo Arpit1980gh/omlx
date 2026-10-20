@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional
 
@@ -10,14 +9,6 @@ try:
     from omlx.custom_kernels.sparse_index import fast as _index_fast
 except Exception:  # pragma: no cover - optional native extension
     _index_fast = mx.fast
-
-
-_NATIVE_TOPK_SELECT_MODE = os.environ.get(
-    "MLX_MINIMAX_MSA_NATIVE_TOPK_SELECT", "auto"
-).lower()
-_NATIVE_MSA_TOPK_MODE = os.environ.get(
-    "MLX_MINIMAX_MSA_NATIVE_TOPK", "auto"
-).lower()
 
 
 def _has_minimax_fast_symbol(name: str) -> bool:
@@ -354,78 +345,6 @@ def _select_msa_topk_from_block_scores(
     init_blocks: int,
     local_blocks: int,
 ) -> mx.array:
-    """Select official-style sparse block Top-k from block scores."""
-    if block_scores.ndim != 4:
-        raise ValueError("block_scores must have shape [B, H, L, num_blocks].")
-    if topk != 16:
-        return _select_msa_topk_from_block_scores_fallback(
-            block_scores,
-            q_start=q_start,
-            block_size=block_size,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-        )
-    if not mx.metal.is_available():
-        return _select_msa_topk_from_block_scores_fallback(
-            block_scores,
-            q_start=q_start,
-            block_size=block_size,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-        )
-
-    B, H, L, num_blocks = block_scores.shape
-    force_native = _NATIVE_TOPK_SELECT_MODE in {"1", "true", "yes", "on"}
-    force_fallback = _NATIVE_TOPK_SELECT_MODE in {"0", "false", "no", "off"}
-    use_native = force_native or (
-        not force_fallback and num_blocks <= 256
-    )
-    if not use_native:
-        return _select_msa_topk_from_block_scores_fallback(
-            block_scores,
-            q_start=q_start,
-            block_size=block_size,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-        )
-
-    threads = 256
-    rows = B * H * L
-    block_scores = mx.contiguous(block_scores.astype(mx.float32))
-    return _MSA_TOPK_SELECT(
-        inputs=[block_scores],
-        template=[
-            ("B", B),
-            ("H", H),
-            ("L", L),
-            ("ROWS", rows),
-            ("NUM_BLOCKS", num_blocks),
-            ("TOPK", int(topk)),
-            ("Q_START", int(q_start)),
-            ("BLOCK_SIZE", int(block_size)),
-            ("INIT_BLOCKS", int(init_blocks)),
-            ("LOCAL_BLOCKS", int(local_blocks)),
-            ("THREADS", threads),
-        ],
-        grid=(rows * threads, 1, 1),
-        threadgroup=(threads, 1, 1),
-        output_shapes=[(B, H, L, topk)],
-        output_dtypes=[mx.int32],
-    )[0]
-
-
-def _select_msa_topk_from_block_scores_fallback(
-    block_scores: mx.array,
-    *,
-    q_start: int,
-    block_size: int,
-    topk: int,
-    init_blocks: int,
-    local_blocks: int,
-) -> mx.array:
     B, H_idx, L, num_blocks = block_scores.shape
     neg = mx.array(-float("inf"), dtype=mx.float32)
     qpos = mx.arange(q_start, q_start + L)
@@ -472,10 +391,6 @@ def _build_grouped_msa_topk_native(
     init_blocks: int,
     local_blocks: int,
 ) -> Optional[mx.array]:
-    force_native = _NATIVE_MSA_TOPK_MODE in {"1", "true", "yes", "on"}
-    force_fallback = _NATIVE_MSA_TOPK_MODE in {"0", "false", "no", "off"}
-    if force_fallback:
-        return None
     if not _has_minimax_fast_symbol("msa_block_topk"):
         return None
     if not mx.metal.is_available():
@@ -503,324 +418,7 @@ def _build_grouped_msa_topk_native(
             local_blocks=int(local_blocks),
         )
     except Exception:
-        if force_native:
-            raise
         return None
-
-
-_MSA_CSR_K1_SCALAR = mx.fast.metal_kernel(
-    name="minimax_m3_msa_csr_k1_scalar",
-    input_names=["q", "k", "v", "row_ptr", "qsplit", "scale"],
-    output_names=["o_partial", "lse_partial"],
-    source=r"""
-        uint work = threadgroup_position_in_grid.x;
-        uint tid = thread_index_in_threadgroup;
-        uint total_work = H_KV * NNZ_CAP;
-        if (work >= total_work) {
-            return;
-        }
-
-        int edge = work % NNZ_CAP;
-        int hkv = work / NNZ_CAP;
-
-        int qsplit_value = qsplit[hkv * NNZ_CAP + edge];
-        if (qsplit_value < 0) {
-            return;
-        }
-
-        int q_idx = qsplit_value & 0x00FFFFFF;
-        int split_idx = (qsplit_value >> 24) & 0xFF;
-
-        int row_base = hkv * (TOTAL_ROWS + 1);
-        int left = 0;
-        int right = TOTAL_ROWS;
-        for (int step = 0; step < 32; ++step) {
-            if (left < right) {
-                int mid = (left + right) >> 1;
-                int row_end = row_ptr[row_base + mid + 1];
-                if (row_end <= edge) {
-                    left = mid + 1;
-                } else {
-                    right = mid;
-                }
-            }
-        }
-        int kv_block = left;
-        int block_start = kv_block * BLOCK_SIZE;
-        int q_abs = Q_START + q_idx;
-
-        threadgroup float scores[QHEAD_PER_KV * BLOCK_SIZE];
-        threadgroup float row_maxes[QHEAD_PER_KV];
-        threadgroup float denoms[QHEAD_PER_KV];
-
-        int score_cells = QHEAD_PER_KV * BLOCK_SIZE;
-        for (int cell = int(tid); cell < score_cells; cell += THREADGROUP_SIZE) {
-            int h_in_group = cell / BLOCK_SIZE;
-            int s = cell - h_in_group * BLOCK_SIZE;
-            int k_pos = block_start + s;
-            if (k_pos >= TOTAL_K || k_pos > q_abs) {
-                scores[cell] = -INFINITY;
-                continue;
-            }
-            int hq = hkv * QHEAD_PER_KV + h_in_group;
-            int q_base = (q_idx * H_Q + hq) * D;
-            int k_base = (k_pos * H_KV + hkv) * D;
-            float score = 0.0f;
-            for (int d = 0; d < D; ++d) {
-                score += float(q[q_base + d]) * float(k[k_base + d]);
-            }
-            scores[cell] = score * scale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (tid < QHEAD_PER_KV) {
-            int h_in_group = int(tid);
-            int score_base = h_in_group * BLOCK_SIZE;
-            float row_max = -INFINITY;
-            for (int s = int(tid); s < BLOCK_SIZE; s += THREADGROUP_SIZE) {
-                row_max = max(row_max, scores[score_base + s]);
-            }
-            for (int s = 0; s < BLOCK_SIZE; ++s) {
-                row_max = max(row_max, scores[score_base + s]);
-            }
-            float denom = 0.0f;
-            if (row_max != -INFINITY) {
-                for (int s = 0; s < BLOCK_SIZE; ++s) {
-                    float score = scores[score_base + s];
-                    if (score != -INFINITY) {
-                        denom += metal::exp(score - row_max);
-                    }
-                }
-            }
-            row_maxes[h_in_group] = row_max;
-            denoms[h_in_group] = denom;
-            int hq = hkv * QHEAD_PER_KV + h_in_group;
-            int lse_idx = (split_idx * TOTAL_Q + q_idx) * H_Q + hq;
-            lse_partial[lse_idx] = row_max == -INFINITY ? -INFINITY : row_max + metal::log(denom);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        int out_cells = QHEAD_PER_KV * D;
-        for (int cell = int(tid); cell < out_cells; cell += THREADGROUP_SIZE) {
-            int h_in_group = cell / D;
-            int d = cell - h_in_group * D;
-            int hq = hkv * QHEAD_PER_KV + h_in_group;
-            float row_max = row_maxes[h_in_group];
-            float denom = denoms[h_in_group];
-            float acc = 0.0f;
-            if (denom > 0.0f) {
-                int score_base = h_in_group * BLOCK_SIZE;
-                for (int s = 0; s < BLOCK_SIZE; ++s) {
-                    float score = scores[score_base + s];
-                    if (score == -INFINITY) {
-                        continue;
-                    }
-                    int k_pos = block_start + s;
-                    int v_base = (k_pos * H_KV + hkv) * D;
-                    float weight = metal::exp(score - row_max) / denom;
-                    acc += weight * float(v[v_base + d]);
-                }
-            }
-            int partial_idx = ((split_idx * TOTAL_Q + q_idx) * H_Q + hq) * D + d;
-            o_partial[partial_idx] = T(acc);
-        }
-    """,
-)
-
-
-_MSA_CSR_K1_SIMD = mx.fast.metal_kernel(
-    name="minimax_m3_msa_csr_k1_simd",
-    input_names=["q", "k", "v", "row_ptr", "qsplit", "scale"],
-    output_names=["o_partial", "lse_partial"],
-    header="#include <metal_simdgroup>\nusing namespace metal;\n",
-    source=r"""
-        uint work = threadgroup_position_in_grid.x;
-        uint total_work = H_KV * NNZ_CAP;
-        if (work >= total_work) {
-            return;
-        }
-
-        int edge = work % NNZ_CAP;
-        int hkv = work / NNZ_CAP;
-        int qsplit_value = qsplit[hkv * NNZ_CAP + edge];
-        if (qsplit_value < 0) {
-            return;
-        }
-
-        int q_idx = qsplit_value & 0x00FFFFFF;
-        int split_idx = (qsplit_value >> 24) & 0xFF;
-
-        int row_base = hkv * (TOTAL_ROWS + 1);
-        int left = 0;
-        int right = TOTAL_ROWS;
-        for (int step = 0; step < 32; ++step) {
-            if (left < right) {
-                int mid = (left + right) >> 1;
-                int row_end = row_ptr[row_base + mid + 1];
-                if (row_end <= edge) {
-                    left = mid + 1;
-                } else {
-                    right = mid;
-                }
-            }
-        }
-        int kv_block = left;
-        int block_start = kv_block * BLOCK_SIZE;
-        int q_abs = Q_START + q_idx;
-
-        int h_in_group = int(simdgroup_index_in_threadgroup);
-        int lane = int(thread_index_in_simdgroup);
-        if (h_in_group >= QHEAD_PER_KV) {
-            return;
-        }
-        int hq = hkv * QHEAD_PER_KV + h_in_group;
-
-        thread float q_frag[D_PER_LANE];
-        thread float out_frag[D_PER_LANE];
-        int dim_base = lane * D_PER_LANE;
-        int q_base = (q_idx * H_Q + hq) * D + dim_base;
-        for (int d = 0; d < D_PER_LANE; ++d) {
-            q_frag[d] = float(q[q_base + d]);
-            out_frag[d] = 0.0f;
-        }
-
-        float row_max = -INFINITY;
-        float denom = 0.0f;
-        for (int s = 0; s < BLOCK_SIZE; ++s) {
-            int k_pos = block_start + s;
-            bool valid = k_pos < TOTAL_K && k_pos <= q_abs;
-            float partial = 0.0f;
-            if (valid) {
-                int k_base = (k_pos * H_KV + hkv) * D + dim_base;
-                for (int d = 0; d < D_PER_LANE; ++d) {
-                    partial += q_frag[d] * float(k[k_base + d]);
-                }
-            }
-            float score = simd_sum(partial) * scale;
-            if (valid) {
-                float new_max = max(row_max, score);
-                float old_scale = fast::exp(row_max - new_max);
-                float weight = fast::exp(score - new_max);
-                int v_base = (k_pos * H_KV + hkv) * D + dim_base;
-                for (int d = 0; d < D_PER_LANE; ++d) {
-                    out_frag[d] =
-                        out_frag[d] * old_scale + weight * float(v[v_base + d]);
-                }
-                denom = denom * old_scale + weight;
-                row_max = new_max;
-            }
-        }
-
-        int partial_base = ((split_idx * TOTAL_Q + q_idx) * H_Q + hq) * D + dim_base;
-        float denom_rcp = denom > 0.0f ? 1.0f / denom : 0.0f;
-        for (int d = 0; d < D_PER_LANE; ++d) {
-            o_partial[partial_base + d] = T(out_frag[d] * denom_rcp);
-        }
-        if (lane == 0) {
-            int lse_idx = (split_idx * TOTAL_Q + q_idx) * H_Q + hq;
-            lse_partial[lse_idx] =
-                denom > 0.0f ? row_max + metal::log(denom) : -INFINITY;
-        }
-    """,
-)
-
-
-_MSA_CSR_K1_SIMD_PACKED = mx.fast.metal_kernel(
-    name="minimax_m3_msa_csr_k1_simd_packed",
-    input_names=["q", "k", "v", "row_ptr", "qsplit", "scale"],
-    output_names=["o_partial", "lse_partial"],
-    header="#include <metal_simdgroup>\nusing namespace metal;\n",
-    source=r"""
-        uint work = threadgroup_position_in_grid.x;
-        uint total_work = H_KV * TOTAL_ROWS * GROUPS_PER_ROW_CAP;
-        if (work >= total_work) {
-            return;
-        }
-
-        int group_id = int(work % GROUPS_PER_ROW_CAP);
-        int row = int((work / GROUPS_PER_ROW_CAP) % TOTAL_ROWS);
-        int hkv = int(work / (GROUPS_PER_ROW_CAP * TOTAL_ROWS));
-
-        int row_base = hkv * (TOTAL_ROWS + 1);
-        int row_start = row_ptr[row_base + row];
-        int row_end = row_ptr[row_base + row + 1];
-        int edge_base = row_start + group_id * Q_TOKENS_PER_GROUP;
-        if (edge_base >= row_end) {
-            return;
-        }
-
-        int block_start = row * BLOCK_SIZE;
-        int h_in_group = int(simdgroup_index_in_threadgroup);
-        int lane = int(thread_index_in_simdgroup);
-        if (h_in_group >= QHEAD_PER_KV) {
-            return;
-        }
-        int hq = hkv * QHEAD_PER_KV + h_in_group;
-        int dim_base = lane * D_PER_LANE;
-
-        thread float q_frag[D_PER_LANE];
-        thread float out_frag[D_PER_LANE];
-
-        for (int qt = 0; qt < Q_TOKENS_PER_GROUP; ++qt) {
-            int edge = edge_base + qt;
-            if (edge >= row_end) {
-                break;
-            }
-            int qsplit_value = qsplit[hkv * NNZ_CAP + edge];
-            if (qsplit_value < 0) {
-                continue;
-            }
-
-            int q_idx = qsplit_value & 0x00FFFFFF;
-            int split_idx = (qsplit_value >> 24) & 0xFF;
-            int q_abs = Q_START + q_idx;
-            int q_base = (q_idx * H_Q + hq) * D + dim_base;
-            for (int d = 0; d < D_PER_LANE; ++d) {
-                q_frag[d] = float(q[q_base + d]);
-                out_frag[d] = 0.0f;
-            }
-
-            float row_max = -INFINITY;
-            float denom = 0.0f;
-            for (int s = 0; s < BLOCK_SIZE; ++s) {
-                int k_pos = block_start + s;
-                bool valid = k_pos < TOTAL_K && k_pos <= q_abs;
-                float partial = 0.0f;
-                if (valid) {
-                    int k_base = (k_pos * H_KV + hkv) * D + dim_base;
-                    for (int d = 0; d < D_PER_LANE; ++d) {
-                        partial += q_frag[d] * float(k[k_base + d]);
-                    }
-                }
-                float score = simd_sum(partial) * scale;
-                if (valid) {
-                    float new_max = max(row_max, score);
-                    float old_scale = fast::exp(row_max - new_max);
-                    float weight = fast::exp(score - new_max);
-                    int v_base = (k_pos * H_KV + hkv) * D + dim_base;
-                    for (int d = 0; d < D_PER_LANE; ++d) {
-                        out_frag[d] =
-                            out_frag[d] * old_scale + weight * float(v[v_base + d]);
-                    }
-                    denom = denom * old_scale + weight;
-                    row_max = new_max;
-                }
-            }
-
-            int partial_base =
-                ((split_idx * TOTAL_Q + q_idx) * H_Q + hq) * D + dim_base;
-            float denom_rcp = denom > 0.0f ? 1.0f / denom : 0.0f;
-            for (int d = 0; d < D_PER_LANE; ++d) {
-                o_partial[partial_base + d] = T(out_frag[d] * denom_rcp);
-            }
-            if (lane == 0) {
-                int lse_idx = (split_idx * TOTAL_Q + q_idx) * H_Q + hq;
-                lse_partial[lse_idx] =
-                    denom > 0.0f ? row_max + metal::log(denom) : -INFINITY;
-            }
-        }
-    """,
-)
 
 
 _MSA_CSR_K2 = mx.fast.metal_kernel(
@@ -876,119 +474,6 @@ _MSA_CSR_K2 = mx.fast.metal_kernel(
 )
 
 
-_MSA_TOPK_SELECT = mx.fast.metal_kernel(
-    name="minimax_m3_msa_topk_select",
-    input_names=["block_scores"],
-    output_names=["topk_idx"],
-    source=r"""
-        uint row = threadgroup_position_in_grid.x;
-        uint tid = thread_index_in_threadgroup;
-        if (row >= ROWS) {
-            return;
-        }
-
-        int q_idx = int(row % L);
-        int h = int((row / L) % H);
-        int b = int(row / (L * H));
-        int q_abs = Q_START + q_idx;
-        int cur_block = q_abs / BLOCK_SIZE;
-        int local_start = cur_block - LOCAL_BLOCKS + 1;
-        if (local_start < 0) {
-            local_start = 0;
-        }
-
-        threadgroup float scores_s[THREADS];
-        threadgroup int indices_s[THREADS];
-        threadgroup int selected_s[TOPK];
-
-        if (tid < TOPK) {
-            selected_s[tid] = NUM_BLOCKS;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (int slot = 0; slot < TOPK; ++slot) {
-            float best_score = -INFINITY;
-            int best_idx = NUM_BLOCKS;
-            for (int block = int(tid); block < NUM_BLOCKS; block += THREADS) {
-                bool valid = block <= cur_block;
-                bool already = false;
-                for (int prev = 0; prev < slot; ++prev) {
-                    already = already || (selected_s[prev] == block);
-                }
-                if (!valid || already) {
-                    continue;
-                }
-
-                int offset = ((b * H + h) * L + q_idx) * NUM_BLOCKS + block;
-                float score = float(block_scores[offset]);
-                if (score != score) {
-                    score = -INFINITY;
-                }
-                if (INIT_BLOCKS > 0 && block < INIT_BLOCKS) {
-                    score = 1.0e30f;
-                }
-                if (
-                    LOCAL_BLOCKS > 0
-                    && block >= local_start
-                    && block <= cur_block
-                ) {
-                    score = 1.0e29f;
-                }
-                if (score > best_score || (score == best_score && block < best_idx)) {
-                    best_score = score;
-                    best_idx = block;
-                }
-            }
-
-            scores_s[tid] = best_score;
-            indices_s[tid] = best_idx;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (uint stride = THREADS / 2; stride > 0; stride >>= 1) {
-                if (tid < stride) {
-                    float other_score = scores_s[tid + stride];
-                    int other_idx = indices_s[tid + stride];
-                    float cur_score = scores_s[tid];
-                    int cur_idx = indices_s[tid];
-                    if (
-                        other_score > cur_score
-                        || (other_score == cur_score && other_idx < cur_idx)
-                    ) {
-                        scores_s[tid] = other_score;
-                        indices_s[tid] = other_idx;
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-
-            if (tid == 0) {
-                selected_s[slot] = indices_s[0];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        if (tid == 0) {
-            for (int i = 0; i < TOPK; ++i) {
-                for (int j = i + 1; j < TOPK; ++j) {
-                    if (selected_s[j] < selected_s[i]) {
-                        int tmp = selected_s[i];
-                        selected_s[i] = selected_s[j];
-                        selected_s[j] = tmp;
-                    }
-                }
-            }
-
-            int out_base = row * TOPK;
-            for (int i = 0; i < TOPK; ++i) {
-                int idx = selected_s[i];
-                topk_idx[out_base + i] = idx < NUM_BLOCKS ? idx : -1;
-            }
-        }
-    """,
-)
-
-
-@mx.compile
 def build_grouped_msa_topk(
     idx_queries: mx.array,
     idx_keys: mx.array,
@@ -998,86 +483,18 @@ def build_grouped_msa_topk(
     topk: int,
     init_blocks: int,
     local_blocks: int,
-) -> mx.array:
-    """Build MiniMax MSA q2k block indices per GQA/KV group.
-
-    This matches the official sparse metadata contract:
-    ``q2k_indices [B, H_kv, L, topK]`` with invalid entries padded by ``-1``.
-    It covers the causal text-prefill path used by MiniMax M3 serving.
-    """
-    native = _build_grouped_msa_topk_native(
-        idx_queries,
-        idx_keys,
-        q_start,
-        scale,
-        block_size,
-        topk,
-        init_blocks,
-        local_blocks,
-    )
-    if native is not None:
-        return native
-
-    B, H_idx, L, _ = idx_queries.shape
-    total_len = idx_keys.shape[2]
-    neg = mx.array(-float("inf"), dtype=mx.float32)
-
-    scores = mx.matmul(
-        idx_queries.astype(mx.float32),
-        idx_keys.astype(mx.float32).swapaxes(-1, -2),
-    )
-    scores = scores * scale
-
-    qpos = mx.arange(q_start, q_start + L)
-    kpos = mx.arange(total_len)
-    causal = kpos[None, None, None, :] <= qpos[None, None, :, None]
-    scores = mx.where(causal, scores, neg)
-
-    num_blocks = (total_len + block_size - 1) // block_size
-    pad = num_blocks * block_size - total_len
-    if pad:
-        pad_values = mx.full(
-            (*scores.shape[:-1], pad), -float("inf"), dtype=scores.dtype
-        )
-        scores = mx.concatenate([scores, pad_values], axis=-1)
-
-    scores = scores.reshape(B, H_idx, L, num_blocks, block_size)
-    block_scores = mx.max(scores, axis=-1)
-    block_scores = mx.where(block_scores == block_scores, block_scores, neg)
-
-    return _select_msa_topk_from_block_scores(
-        block_scores,
-        q_start=q_start,
-        block_size=block_size,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-    )
-
-
-def build_grouped_msa_topk_blockwise(
-    idx_queries: mx.array,
-    idx_keys: mx.array,
-    q_start: int,
-    scale: float,
-    block_size: int,
-    topk: int,
-    init_blocks: int,
-    local_blocks: int,
     *,
-    block_chunk_size: int = 16,
+    block_chunk_size: Optional[int] = None,
 ) -> mx.array:
-    """Memory-bounded MiniMax MSA q2k block top-k builder.
+    """MiniMax MSA q2k block top-k per KV group, ``[B, H_kv, L, topK]``.
 
-    The result matches :func:`build_grouped_msa_topk`, but it never materializes
-    the full token score tensor ``[B, H_kv, L, total_k]``.  Instead, it computes
-    scores for a small number of KV blocks, immediately reduces each block to
-    a block score, then concatenates only ``[B, H_kv, L, num_blocks]`` scores.
+    Invalid entries are ``-1``, as in the official sparse metadata contract.
+    Without the native kernel, scores are computed ``block_chunk_size`` KV
+    blocks at a time (all at once when None) and reduced to block scores right
+    away, so a long context never holds the ``[B, H_kv, L, total_k]`` scores.
     """
     if idx_queries.ndim != 4 or idx_keys.ndim != 4:
         raise ValueError("idx_queries/idx_keys must have shape [B, H, L, D].")
-    if block_chunk_size <= 0:
-        raise ValueError("block_chunk_size must be positive.")
 
     native = _build_grouped_msa_topk_native(
         idx_queries,
@@ -1095,13 +512,14 @@ def build_grouped_msa_topk_blockwise(
     B, H_idx, L, _ = idx_queries.shape
     total_len = idx_keys.shape[2]
     num_blocks = (total_len + block_size - 1) // block_size
+    chunk = block_chunk_size or num_blocks
     neg = mx.array(-float("inf"), dtype=mx.float32)
 
     q = idx_queries.astype(mx.float32)
     qpos = mx.arange(q_start, q_start + L)
     block_score_chunks = []
-    for block_start in range(0, num_blocks, block_chunk_size):
-        blocks_in_chunk = min(block_chunk_size, num_blocks - block_start)
+    for block_start in range(0, num_blocks, chunk):
+        blocks_in_chunk = min(chunk, num_blocks - block_start)
         token_start = block_start * block_size
         token_end = min(total_len, token_start + blocks_in_chunk * block_size)
         token_count = token_end - token_start
@@ -1114,7 +532,9 @@ def build_grouped_msa_topk_blockwise(
 
         pad = blocks_in_chunk * block_size - token_count
         if pad:
-            pad_values = mx.full((*scores.shape[:-1], pad), -float("inf"), dtype=scores.dtype)
+            pad_values = mx.full(
+                (*scores.shape[:-1], pad), -float("inf"), dtype=scores.dtype
+            )
             scores = mx.concatenate([scores, pad_values], axis=-1)
 
         scores = scores.reshape(B, H_idx, L, blocks_in_chunk, block_size)
@@ -1138,25 +558,16 @@ def build_k2q_csr_b1(
     *,
     total_k: int,
     block_size: int,
-    return_qsplits: bool = False,
-    return_q_indices: bool = True,
-    return_split_counts: bool = True,
-) -> (
-    tuple[mx.array, mx.array]
-    | tuple[mx.array, Optional[mx.array], mx.array, Optional[mx.array]]
-):
-    """Build official-style k2q CSR metadata for the B=1 prefill hot path.
+    with_split_counts: bool = True,
+) -> tuple[mx.array, mx.array, Optional[mx.array]]:
+    """Official-style k2q CSR metadata for the B=1 prefill path.
 
-    Parameters follow the official MSA sparse-index contract:
-    ``q2k_indices [H_kv, total_q, topK]`` contains batch-local KV block indices
-    with ``-1`` padding. The returned base tensors are ``k2q_row_ptr
-    [H_kv, total_rows + 1]`` and ``k2q_q_indices [H_kv, total_q * topK]``.
-    If ``return_qsplits`` is true, also return the official packed
-    ``qsplit`` payload and optionally ``split_counts [total_q, H_kv]`` used by
-    K2 combine. Serving K1 consumes ``qsplit`` directly, so callers can skip
-    ``q_indices`` materialization while metadata checks keep the full official
-    tensor set. Long prefill chunks with complete top-k splits can also skip
-    ``split_counts`` because K2's ``FULL_SPLITS`` path uses ``TOPK`` directly.
+    ``q2k_indices [H_kv, total_q, topK]`` holds batch-local KV block indices
+    padded with ``-1``. Returns ``k2q_row_ptr [H_kv, total_rows + 1]``, the
+    packed ``qsplit [H_kv, total_q * topK]`` (top-k slot << 24 | query) that K1
+    reads, and ``split_counts [total_q, H_kv]`` for K2. A chunk with complete
+    top-k splits skips the counts, since K2's ``FULL_SPLITS`` path uses
+    ``TOPK`` directly.
     """
     if q2k_indices.ndim != 3:
         raise ValueError("q2k_indices must have shape [H_kv, total_q, topK].")
@@ -1190,189 +601,22 @@ def build_k2q_csr_b1(
     sorted_q = mx.take_along_axis(q_flat, sort_order, axis=1)
     sorted_slot = mx.take_along_axis(slot_flat, sort_order, axis=1)
     sorted_valid = mx.take_along_axis(valid, sort_order, axis=1)
-    invalid = mx.array(-1, dtype=mx.int32)
-    q_indices = None
-    if not return_qsplits or return_q_indices:
-        q_indices = mx.where(sorted_valid, sorted_q, invalid)
-    if not return_qsplits:
-        if q_indices is None:
-            raise RuntimeError("q_indices must be built when qsplit is not returned.")
-        return row_ptr, q_indices
-
     qsplit = sorted_slot * mx.array(1 << 24, dtype=mx.int32) + sorted_q
-    qsplit = mx.where(sorted_valid, qsplit, invalid)
+    qsplit = mx.where(sorted_valid, qsplit, mx.array(-1, dtype=mx.int32))
     split_counts = None
-    if return_split_counts:
+    if with_split_counts:
         split_counts = mx.sum(q2k_indices >= 0, axis=-1).astype(mx.int32).T
-    return row_ptr, q_indices, qsplit, split_counts
+    return row_ptr, qsplit, split_counts
 
 
-def msa_sparse_attention_b1_from_csr(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    row_ptr: mx.array,
-    qsplit: mx.array,
-    split_counts: Optional[mx.array],
-    *,
-    q_start: int,
-    scale: float,
-    block_size: int,
-    topk: int,
-    k1_impl: str = "auto",
-    full_splits: bool = False,
-) -> mx.array:
-    """Run the MiniMax MSA K1/K2 kernels from prebuilt B=1 CSR metadata."""
-    if not mx.metal.is_available():
-        raise RuntimeError("MiniMax MSA sparse attention requires Metal.")
-    if q.ndim != 3:
-        raise ValueError("q must have shape [total_q, H_q, D].")
-    if k.ndim != 3 or v.ndim != 3:
-        raise ValueError("k and v must have shape [total_k, H_kv, D].")
-
-    total_q, h_q, dim = q.shape
-    total_k, h_kv, k_dim = k.shape
-    v_total_k, v_h_kv, v_dim = v.shape
-    if (v_total_k, v_h_kv, k_dim, v_dim) != (total_k, h_kv, dim, dim):
-        raise ValueError("K/V shapes must match q head dimension.")
-    if h_q % h_kv != 0:
-        raise ValueError("H_q must be divisible by H_kv.")
-    if row_ptr.shape != (h_kv, (int(total_k) + int(block_size) - 1) // int(block_size) + 1):
-        raise ValueError("row_ptr shape does not match K/V heads and block rows.")
-    if qsplit.shape != (h_kv, total_q * topk):
-        raise ValueError("qsplit shape must be [H_kv, total_q * topK].")
-    if split_counts is None and not full_splits:
-        raise ValueError("split_counts is required unless full_splits is true.")
-    if split_counts is not None and split_counts.shape != (total_q, h_kv):
-        raise ValueError("split_counts shape must be [total_q, H_kv].")
-
-    q = mx.contiguous(q)
-    k = mx.contiguous(k)
-    v = mx.contiguous(v)
-    row_ptr = mx.contiguous(row_ptr)
-    qsplit = mx.contiguous(qsplit)
-    if split_counts is None:
-        split_counts_for_k2 = mx.zeros((1,), dtype=mx.int32)
-    else:
-        split_counts_for_k2 = mx.contiguous(split_counts)
-
-    total_rows = (int(total_k) + int(block_size) - 1) // int(block_size)
-    nnz_cap = total_q * topk
-    qhead_per_kv = h_q // h_kv
-    work_items = h_kv * nnz_cap
-    if k1_impl not in {
-        "auto",
-        "scalar",
-        "simd",
-        "simd_packed",
-        "steel_mma",
-        "steel_mma_bq64",
-    }:
-        raise ValueError(f"Unsupported MiniMax MSA K1 implementation {k1_impl!r}.")
-
-    use_simd_k1 = dim % 32 == 0 and qhead_per_kv <= 16
-    use_packed_k1 = (
-        use_simd_k1 and total_q >= 512 and dim == 128 and int(block_size) == 128
-    )
-    use_steel_mma_k1 = (
-        k1_impl in {"auto", "steel_mma", "steel_mma_bq64"}
-        and _MSA_CSR_K1_STEEL_MMA is not None
-        and total_q >= 8
-        and dim == 128
-        and int(block_size) == 128
+def msa_prefill_supported(head_dim: int, block_size: int, qhead_per_kv: int) -> bool:
+    """Whether the K1 kernel covers this attention shape (MiniMax M3 and M3.1)."""
+    return (
+        _MSA_CSR_K1_STEEL_MMA is not None
+        and head_dim == 128
+        and block_size == 128
         and qhead_per_kv == 16
     )
-    if k1_impl in {"steel_mma", "steel_mma_bq64"} and not use_steel_mma_k1:
-        raise RuntimeError(
-            "Steel MMA K1 requires Metal, D=128, block_size=128, "
-            "qhead_per_kv=16, and total_q>=8."
-        )
-    if k1_impl == "scalar":
-        use_simd_k1 = False
-        use_packed_k1 = False
-    elif k1_impl == "simd":
-        use_packed_k1 = False
-    elif k1_impl == "simd_packed" and not use_packed_k1:
-        raise RuntimeError("SIMD packed K1 is not available for this shape.")
-
-    threadgroup_size = qhead_per_kv * 32 if use_simd_k1 else 256
-
-    if use_steel_mma_k1:
-        q_tokens_per_group = 4 if k1_impl == "steel_mma_bq64" else 8
-        groups_per_row_cap = (total_q + q_tokens_per_group - 1) // q_tokens_per_group
-        work_items = h_kv * total_rows * groups_per_row_cap
-        threadgroup_size = (q_tokens_per_group * qhead_per_kv // 8) * 32
-        k1_kernel = _MSA_CSR_K1_STEEL_MMA
-    elif use_packed_k1:
-        q_tokens_per_group = 8
-        groups_per_row_cap = (total_q + q_tokens_per_group - 1) // q_tokens_per_group
-        work_items = h_kv * total_rows * groups_per_row_cap
-        k1_kernel = _MSA_CSR_K1_SIMD_PACKED
-    else:
-        q_tokens_per_group = 1
-        groups_per_row_cap = 0
-        k1_kernel = _MSA_CSR_K1_SIMD if use_simd_k1 else _MSA_CSR_K1_SCALAR
-
-    if split_counts is None:
-        mx.eval(row_ptr, qsplit)
-    else:
-        mx.eval(row_ptr, qsplit, split_counts_for_k2)
-
-    k1_template = [
-        ("T", q.dtype),
-        ("TOTAL_Q", total_q),
-        ("TOTAL_K", total_k),
-        ("H_Q", h_q),
-        ("H_KV", h_kv),
-        ("D", dim),
-        ("TOPK", topk),
-        ("NNZ_CAP", nnz_cap),
-        ("TOTAL_ROWS", total_rows),
-        ("BLOCK_SIZE", int(block_size)),
-        ("Q_START", int(q_start)),
-        ("QHEAD_PER_KV", qhead_per_kv),
-        ("THREADGROUP_SIZE", threadgroup_size),
-    ]
-    if use_simd_k1:
-        k1_template.append(("D_PER_LANE", dim // 32))
-    if use_packed_k1 or use_steel_mma_k1:
-        k1_template.extend(
-            [
-                ("Q_TOKENS_PER_GROUP", q_tokens_per_group),
-                ("GROUPS_PER_ROW_CAP", groups_per_row_cap),
-            ]
-        )
-    if use_steel_mma_k1:
-        k1_template.append(("M_BLOCK_SIZE", q_tokens_per_group * qhead_per_kv))
-
-    k1_inputs = [q, k, v, row_ptr, qsplit, float(scale)]
-    o_partial, lse_partial = k1_kernel(
-        inputs=k1_inputs,
-        template=k1_template,
-        grid=(work_items * threadgroup_size, 1, 1),
-        threadgroup=(threadgroup_size, 1, 1),
-        output_shapes=[(topk, total_q, h_q, dim), (topk, total_q, h_q)],
-        output_dtypes=[q.dtype, mx.float32],
-    )
-
-    out = _MSA_CSR_K2(
-        inputs=[o_partial, lse_partial, split_counts_for_k2],
-        template=[
-            ("T", q.dtype),
-            ("TOTAL_Q", total_q),
-            ("H_Q", h_q),
-            ("H_KV", h_kv),
-            ("D", dim),
-            ("TOPK", topk),
-            ("QHEAD_PER_KV", qhead_per_kv),
-            ("FULL_SPLITS", 1 if full_splits else 0),
-        ],
-        grid=(q.size, 1, 1),
-        threadgroup=(min(256, q.size), 1, 1),
-        output_shapes=[q.shape],
-        output_dtypes=[q.dtype],
-    )[0]
-    return out
 
 
 def msa_sparse_attention_b1(
@@ -1384,22 +628,16 @@ def msa_sparse_attention_b1(
     q_start: int,
     scale: float,
     block_size: int,
-    k1_impl: str = "auto",
     full_splits: bool = False,
 ) -> mx.array:
-    """Official-structure MSA sparse attention for the B=1 prefill path.
+    """MSA sparse attention for the B=1 prefill path (``total_q`` >= 8).
 
-    The implementation mirrors the official K1/K2 contract:
+    The implementation follows the official K1/K2 contract:
     1. build ``k2q`` CSR from group-specific ``q2k``;
     2. K1 visits CSR KV-block rows and writes ``O_partial``/``LSE_partial`` by
        top-k split slot;
     3. K2 combines split partials with log-sum-exp correction.
-
-    This is a correctness-first Metal implementation of the official dataflow.
-    It is intentionally not wired into serving until it beats the existing path.
     """
-    if not mx.metal.is_available():
-        raise RuntimeError("MiniMax MSA sparse attention requires Metal.")
     if q.ndim != 3:
         raise ValueError("q must have shape [total_q, H_q, D].")
     if k.ndim != 3 or v.ndim != 3:
@@ -1417,29 +655,80 @@ def msa_sparse_attention_b1(
         raise ValueError("q2k_indices shape must match K/V heads and Q length.")
     if h_q % h_kv != 0:
         raise ValueError("H_q must be divisible by H_kv.")
+    qhead_per_kv = h_q // h_kv
+    if total_q < 8 or not msa_prefill_supported(dim, int(block_size), qhead_per_kv):
+        raise RuntimeError(
+            "MiniMax MSA prefill attention needs Metal with MLX's steel attention "
+            "headers, D=128, block_size=128, 16 query heads per KV head and at "
+            "least 8 query tokens."
+        )
 
-    row_ptr, _, qsplit, split_counts = build_k2q_csr_b1(
+    row_ptr, qsplit, split_counts = build_k2q_csr_b1(
         q2k_indices,
         total_k=total_k,
         block_size=block_size,
-        return_qsplits=True,
-        return_q_indices=False,
-        return_split_counts=not full_splits,
+        with_split_counts=not full_splits,
     )
-    return msa_sparse_attention_b1_from_csr(
-        q,
-        k,
-        v,
-        row_ptr,
-        qsplit,
-        split_counts,
-        q_start=q_start,
-        scale=scale,
-        block_size=block_size,
-        topk=topk,
-        k1_impl=k1_impl,
-        full_splits=full_splits,
+    q = mx.contiguous(q)
+    k = mx.contiguous(k)
+    v = mx.contiguous(v)
+    row_ptr = mx.contiguous(row_ptr)
+    qsplit = mx.contiguous(qsplit)
+    if split_counts is None:
+        split_counts_for_k2 = mx.zeros((1,), dtype=mx.int32)
+        mx.eval(row_ptr, qsplit)
+    else:
+        split_counts_for_k2 = mx.contiguous(split_counts)
+        mx.eval(row_ptr, qsplit, split_counts_for_k2)
+
+    total_rows = (int(total_k) + int(block_size) - 1) // int(block_size)
+    q_tokens_per_group = 8
+    groups_per_row_cap = (total_q + q_tokens_per_group - 1) // q_tokens_per_group
+    work_items = h_kv * total_rows * groups_per_row_cap
+    threadgroup_size = (q_tokens_per_group * qhead_per_kv // 8) * 32
+    o_partial, lse_partial = _MSA_CSR_K1_STEEL_MMA(
+        inputs=[q, k, v, row_ptr, qsplit, float(scale)],
+        template=[
+            ("T", q.dtype),
+            ("TOTAL_Q", total_q),
+            ("TOTAL_K", total_k),
+            ("H_Q", h_q),
+            ("H_KV", h_kv),
+            ("D", dim),
+            ("TOPK", topk),
+            ("NNZ_CAP", total_q * topk),
+            ("TOTAL_ROWS", total_rows),
+            ("BLOCK_SIZE", int(block_size)),
+            ("Q_START", int(q_start)),
+            ("QHEAD_PER_KV", qhead_per_kv),
+            ("THREADGROUP_SIZE", threadgroup_size),
+            ("Q_TOKENS_PER_GROUP", q_tokens_per_group),
+            ("GROUPS_PER_ROW_CAP", groups_per_row_cap),
+            ("M_BLOCK_SIZE", q_tokens_per_group * qhead_per_kv),
+        ],
+        grid=(work_items * threadgroup_size, 1, 1),
+        threadgroup=(threadgroup_size, 1, 1),
+        output_shapes=[(topk, total_q, h_q, dim), (topk, total_q, h_q)],
+        output_dtypes=[q.dtype, mx.float32],
     )
+
+    return _MSA_CSR_K2(
+        inputs=[o_partial, lse_partial, split_counts_for_k2],
+        template=[
+            ("T", q.dtype),
+            ("TOTAL_Q", total_q),
+            ("H_Q", h_q),
+            ("H_KV", h_kv),
+            ("D", dim),
+            ("TOPK", topk),
+            ("QHEAD_PER_KV", qhead_per_kv),
+            ("FULL_SPLITS", 1 if full_splits else 0),
+        ],
+        grid=(q.size, 1, 1),
+        threadgroup=(min(256, q.size), 1, 1),
+        output_shapes=[q.shape],
+        output_dtypes=[q.dtype],
+    )[0]
 
 
 # Block scores for decode and short verify calls. One threadgroup scores one

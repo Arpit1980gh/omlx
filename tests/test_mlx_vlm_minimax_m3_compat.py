@@ -265,10 +265,11 @@ def test_minimax_nvfp4_experts_match_dequantized_reference():
 
     from mlx_vlm.models.minimax_m3_vl.language import (
         MiniMaxSparseMoeBlock,
-        _swiglu_oai,
+        MiniMaxSwiGLUOAI,
     )
     from mlx_vlm.models.minimax_m3_vl.minimax_m3_vl import _sanitize_moe_weights
 
+    swiglu_oai = MiniMaxSwiGLUOAI()
     mx.random.seed(0)
     args = _tiny_text_config(
         pack_shared_expert=False,
@@ -343,12 +344,12 @@ def test_minimax_nvfp4_experts_match_dequantized_reference():
     weights_k = mx.take_along_axis(scores, inds, axis=-1)
     weights_k = weights_k / weights_k.sum(-1, keepdims=True) * 2.0
     expected = x @ shared["up_proj"].T
-    expected = _swiglu_oai(expected, x @ shared["gate_proj"].T) @ shared["down_proj"].T
+    expected = swiglu_oai(expected, x @ shared["gate_proj"].T) @ shared["down_proj"].T
     for t in range(3):
         for slot in range(2):
             expert = int(inds[0, t, slot].item())
             xt = x[0, t]
-            h = _swiglu_oai(xt @ real[(expert, "w3")].T, xt @ real[(expert, "w1")].T)
+            h = swiglu_oai(xt @ real[(expert, "w3")].T, xt @ real[(expert, "w1")].T)
             routed = weights_k[0, t, slot] * (h @ real[(expert, "w2")].T)
             expected[0, t] = expected[0, t] + routed
 
@@ -482,9 +483,6 @@ def test_omlx_loader_respects_minimax_shared_expert_layout_override():
 
 def test_minimax_dspark_runtime_returns_captures_and_rolls_back():
     mx = pytest.importorskip("mlx.core")
-    from omlx.patches.minimax_m3_dspark import install_minimax_dspark_runtime
-
-    install_minimax_dspark_runtime()
     from mlx_vlm.models.minimax_m3_vl.language import LanguageModel
 
     args = _tiny_text_config(

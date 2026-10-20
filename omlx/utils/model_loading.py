@@ -928,14 +928,9 @@ def maybe_apply_pre_load_patches(
     if for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
     ):
-        from ..patches.minimax_m3_dspark import (
-            bundled_dspark_path,
-            install_minimax_dspark_runtime,
-        )
+        from ..patches.minimax_m3_dspark import bundled_dspark_path
 
         minimax_dspark = bundled_dspark_path(model_name)
-        if minimax_dspark is not None:
-            install_minimax_dspark_runtime()
     if _is_mtp_compatible(config, model_type) or dflash_batched or minimax_dspark:
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
