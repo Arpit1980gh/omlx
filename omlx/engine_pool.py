@@ -75,6 +75,7 @@ from .model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
 from .scheduler import SchedulerConfig
 from .settings import get_settings as get_global_settings
@@ -691,6 +692,14 @@ class EnginePool:
             entry.config_model_type, entry.engine_type
         ):
             extra += self._dflash_drafter_estimated_bytes(drafter_id, runtime_settings)
+        elif getattr(runtime_settings, "mtp_enabled", False) and (
+            entry.config_model_type in ("minimax_m3", "minimax_m3_vl")
+        ):
+            # Lightning MTP loads MiniMax's bundled DSpark draft, which takes
+            # neither the DFlash quantization nor the window setting.
+            dspark_path = bundled_dspark_path(entry.model_path)
+            if dspark_path is not None:
+                extra += self._dflash_drafter_estimated_bytes(str(dspark_path), None)
         return base + extra
 
     def _dflash_drafter_estimated_bytes(
@@ -4255,11 +4264,6 @@ class EnginePool:
                 and entry.config_model_type in ("minimax_m3", "minimax_m3_vl")
                 and hasattr(engine, "set_dflash_drafter")
             ):
-                from .patches.minimax_m3_dspark import (
-                    bundled_dspark_path,
-                    load_minimax_dspark_drafter,
-                )
-
                 dspark_path = bundled_dspark_path(entry.model_path)
                 fixed = getattr(model_settings, "mtp_fixed_depth", None)
                 depth = fixed or getattr(model_settings, "mtp_adaptive_max_depth", None)
