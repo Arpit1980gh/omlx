@@ -93,7 +93,7 @@ struct MSA_DivOp {
 
     return mx.fast.metal_kernel(
         name="minimax_m3_msa_csr_k1_steel_mma",
-        input_names=["q", "k", "v", "row_ptr", "qsplit", "scale"],
+        input_names=["q", "k", "v", "row_ptr", "qsplit", "group_ptr", "scale"],
         output_names=["o_partial", "lse_partial"],
         header=header,
         source=r"""
@@ -103,14 +103,23 @@ struct MSA_DivOp {
             constexpr short WM = M_BLOCK_SIZE / 8;
             constexpr short WN = 1;
             constexpr short THREADS = WM * WN * 32;
-            uint work = threadgroup_position_in_grid.x;
-            if (work >= H_KV * TOTAL_ROWS * GROUPS_PER_ROW_CAP) {
-                return;
+            // One threadgroup per query group of a (KV head, block row) that
+            // holds edges, in head, row, group order: the last row whose first
+            // group is at or before this one owns it.
+            int work = int(threadgroup_position_in_grid.x);
+            int lo = 0;
+            int hi = H_KV * TOTAL_ROWS - 1;
+            while (lo < hi) {
+                int mid = (lo + hi + 1) / 2;
+                if (group_ptr[mid] <= work) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
             }
-
-            int group_id = int(work % GROUPS_PER_ROW_CAP);
-            int row = int((work / GROUPS_PER_ROW_CAP) % TOTAL_ROWS);
-            int hkv = int(work / (GROUPS_PER_ROW_CAP * TOTAL_ROWS));
+            int group_id = work - group_ptr[lo];
+            int row = lo % TOTAL_ROWS;
+            int hkv = lo / TOTAL_ROWS;
             int row_base = hkv * (TOTAL_ROWS + 1);
             int row_start = row_ptr[row_base + row];
             int row_end = row_ptr[row_base + row + 1];
@@ -674,20 +683,27 @@ def msa_sparse_attention_b1(
     v = mx.contiguous(v)
     row_ptr = mx.contiguous(row_ptr)
     qsplit = mx.contiguous(qsplit)
+    # K1 launches one threadgroup per group of 8 query edges of a block row,
+    # only for rows that hold edges.
+    q_tokens_per_group = 8
+    groups = (row_ptr[:, 1:] - row_ptr[:, :-1] + q_tokens_per_group - 1) // (
+        q_tokens_per_group
+    )
+    group_ptr = mx.concatenate(
+        [mx.zeros((1,), dtype=mx.int32), mx.cumsum(groups.reshape(-1))]
+    ).astype(mx.int32)
     if split_counts is None:
         split_counts_for_k2 = mx.zeros((1,), dtype=mx.int32)
-        mx.eval(row_ptr, qsplit)
+        mx.eval(row_ptr, qsplit, group_ptr)
     else:
         split_counts_for_k2 = mx.contiguous(split_counts)
-        mx.eval(row_ptr, qsplit, split_counts_for_k2)
+        mx.eval(row_ptr, qsplit, group_ptr, split_counts_for_k2)
+    total_groups = max(int(group_ptr[-1].item()), 1)
 
     total_rows = (int(total_k) + int(block_size) - 1) // int(block_size)
-    q_tokens_per_group = 8
-    groups_per_row_cap = (total_q + q_tokens_per_group - 1) // q_tokens_per_group
-    work_items = h_kv * total_rows * groups_per_row_cap
     threadgroup_size = (q_tokens_per_group * qhead_per_kv // 8) * 32
     o_partial, lse_partial = _MSA_CSR_K1_STEEL_MMA(
-        inputs=[q, k, v, row_ptr, qsplit, float(scale)],
+        inputs=[q, k, v, row_ptr, qsplit, group_ptr, float(scale)],
         template=[
             ("T", q.dtype),
             ("TOTAL_Q", total_q),
@@ -703,10 +719,9 @@ def msa_sparse_attention_b1(
             ("QHEAD_PER_KV", qhead_per_kv),
             ("THREADGROUP_SIZE", threadgroup_size),
             ("Q_TOKENS_PER_GROUP", q_tokens_per_group),
-            ("GROUPS_PER_ROW_CAP", groups_per_row_cap),
             ("M_BLOCK_SIZE", q_tokens_per_group * qhead_per_kv),
         ],
-        grid=(work_items * threadgroup_size, 1, 1),
+        grid=(total_groups * threadgroup_size, 1, 1),
         threadgroup=(threadgroup_size, 1, 1),
         output_shapes=[(topk, total_q, h_q, dim), (topk, total_q, h_q)],
         output_dtypes=[q.dtype, mx.float32],
