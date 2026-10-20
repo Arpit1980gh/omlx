@@ -766,9 +766,9 @@ class MiniMaxMLP(nn.Module):
         self.act_fn = MiniMaxSwiGLUOAI(alpha, limit, beta)
 
     def __call__(self, x):
-        up = rows_linear(self.up_proj, x)
-        gate = rows_linear(self.gate_proj, x)
-        return rows_linear(self.down_proj, self.act_fn(up, gate))
+        projected = _project(self, ("gate_proj", "up_proj"), x, rows_linear)
+        act = self.act_fn(projected["up_proj"], projected["gate_proj"])
+        return rows_linear(self.down_proj, act)
 
 
 class MiniMaxPackedSwitchGLU(nn.Module):
@@ -882,10 +882,10 @@ class _FusedProjections:
         self.quant = quant
         self.views = views
 
-    def current(self, attn) -> bool:
+    def current(self, module) -> bool:
         # A later weight load replaces the row views, so the fusion is rebuilt.
         return all(
-            attn[name].get("weight") is view
+            module[name].get("weight") is view
             for name, view in zip(self.names, self.views)
         )
 
@@ -898,7 +898,7 @@ class _FusedProjections:
         return zip(self.names, mx.split(y, self.splits, axis=-1))
 
 
-def _fuse_projections(attn, names) -> List[_FusedProjections]:
+def _fuse_projections(module, names) -> List[_FusedProjections]:
     """Concatenate same-format projections once and rebind them to row views.
 
     The projections keep working on slices of the fused buffers, so the
@@ -906,7 +906,7 @@ def _fuse_projections(attn, names) -> List[_FusedProjections]:
     """
     by_format = {}
     for name in names:
-        proj = attn[name]
+        proj = module[name]
         # Sharded subclasses add collectives to the forward; keep them as is.
         if type(proj) is not nn.QuantizedLinear or "bias" in proj:
             continue
@@ -917,7 +917,7 @@ def _fuse_projections(attn, names) -> List[_FusedProjections]:
     for (group_size, bits, mode, has_biases), members in by_format.items():
         if len(members) < 2:
             continue
-        projs = [attn[name] for name in members]
+        projs = [module[name] for name in members]
         keys = ("weight", "scales", "biases") if has_biases else ("weight", "scales")
         buffers = {k: mx.concatenate([p[k] for p in projs], axis=0) for k in keys}
         mx.eval(list(buffers.values()))
@@ -942,6 +942,36 @@ def _fuse_projections(attn, names) -> List[_FusedProjections]:
             )
         )
     return fused
+
+
+def _project(module, names, x: mx.array, unfused=None) -> dict:
+    """``{name: module[name](x)}``, same-format projections fused for short calls.
+
+    ``unfused(proj, x)`` applies a projection outside a fused group, ``proj(x)``
+    when None.
+    """
+    out = {}
+    rows = x.size // x.shape[-1]
+    if rows <= _FUSED_PROJECTION_MAX_ROWS:
+        fused = module.__dict__.get("_omlx_fused_projections")
+        if fused is None or not all(group.current(module) for group in fused):
+            fused = _fuse_projections(module, names)
+            module.__dict__["_omlx_fused_projections"] = fused
+        # A row-exact verify runs the MXFP8 group on the decode-exact rows
+        # kernel and an affine group on the row-exact affine tile.
+        exact = rows > 1 and is_row_exact_armed()
+        for group in fused:
+            if not exact or group.quant["mode"] == "mxfp8":
+                out.update(group(x))
+                continue
+            projected = row_exact_linears([module[n] for n in group.names], x)
+            if projected is not None:
+                out.update(zip(group.names, projected))
+    for name in names:
+        if name not in out:
+            proj = module[name]
+            out[name] = proj(x) if unfused is None else unfused(proj, x)
+    return out
 
 
 class MiniMaxAttention(nn.Module):
@@ -1163,27 +1193,7 @@ class MiniMaxAttention(nn.Module):
 
     def _input_projections(self, x: mx.array) -> dict:
         names = _INPUT_PROJECTIONS if self.has_sparse_index else _INPUT_PROJECTIONS[:3]
-        out = {}
-        rows = x.shape[0] * x.shape[1]
-        if rows <= _FUSED_PROJECTION_MAX_ROWS:
-            fused = self.__dict__.get("_omlx_fused_projections")
-            if fused is None or not all(group.current(self) for group in fused):
-                fused = _fuse_projections(self, names)
-                self.__dict__["_omlx_fused_projections"] = fused
-            # A row-exact verify runs the MXFP8 group on the decode-exact rows
-            # kernel and an affine group on the row-exact affine tile.
-            exact = rows > 1 and is_row_exact_armed()
-            for group in fused:
-                if not exact or group.quant["mode"] == "mxfp8":
-                    out.update(group(x))
-                    continue
-                projected = row_exact_linears([self[n] for n in group.names], x)
-                if projected is not None:
-                    out.update(zip(group.names, projected))
-        for name in names:
-            if name not in out:
-                out[name] = self[name](x)
-        return out
+        return _project(self, names, x)
 
     def __call__(
         self,

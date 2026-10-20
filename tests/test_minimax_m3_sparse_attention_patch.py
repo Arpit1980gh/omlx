@@ -273,6 +273,29 @@ def test_short_calls_fuse_input_projections_bit_exactly(language, monkeypatch, m
         assert mx.array_equal(a, b).item()
 
 
+@pytest.mark.parametrize("mode", ["mxfp8", "affine"])
+def test_short_calls_fuse_mlp_gate_and_up_bit_exactly(language, monkeypatch, mode):
+    mx.random.seed(11)
+    mlp = language.MiniMaxMLP(512, 256)
+    quant = {"group_size": 32, "bits": 8, "mode": mode}
+    nn.quantize(
+        mlp, class_predicate=lambda p, m: quant if isinstance(m, nn.Linear) else False
+    )
+    xs = [mx.random.normal((1, n, 512)).astype(mx.bfloat16) for n in (1, 4, 8)]
+
+    monkeypatch.setattr(language, "_FUSED_PROJECTION_MAX_ROWS", 0)
+    separate = [mlp(x) for x in xs]
+    mx.eval(separate)
+    monkeypatch.undo()
+    fused = [mlp(x) for x in xs]
+    mx.eval(fused)
+
+    groups = mlp.__dict__["_omlx_fused_projections"]
+    assert [group.names for group in groups] == [("gate_proj", "up_proj")]
+    for a, b in zip(separate, fused):
+        assert mx.array_equal(a, b).item()
+
+
 @pytest.mark.parametrize("rows", [3, 8])
 def test_short_row_mxfp8_matmul_matches_one_row_decode(language, rows):
     import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
