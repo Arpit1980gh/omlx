@@ -13,6 +13,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
+from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
 
 logger = logging.getLogger(__name__)
@@ -445,6 +446,8 @@ def _patch_mlx_lm_load_config() -> None:
     def _patched(model_path, *args, **kwargs):
         cfg = _original(model_path, *args, **kwargs)
         normalize_hy_v3_rope_config(cfg)
+        # Cluster ranks load MiniMax through mlx-lm, not the patched mlx-vlm.
+        adopt_expert_global_scales(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)

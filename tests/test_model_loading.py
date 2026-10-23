@@ -7,6 +7,7 @@ import sys
 import types
 from unittest.mock import MagicMock
 
+import mlx_lm.utils as mlx_lm_utils
 import pytest
 
 from omlx.utils import model_loading
@@ -1131,6 +1132,40 @@ class TestExpandPerLayerQuantKeys:
             assert (
                 cfg[config_key]["language_model.mtp.0.block.self_attn." + half] is False
             )
+
+
+def test_mlx_lm_load_config_drops_minimax_expert_global_scale_flags(monkeypatch):
+    # Cluster ranks load MiniMax M3.1 NVFP4 experts through mlx-lm.
+    switch = "language_model.model.layers.3.block_sparse_moe.switch_mlp.gate_proj"
+    monkeypatch.setattr(
+        mlx_lm_utils,
+        "load_config",
+        lambda _model_path: {
+            "model_type": "minimax_m3_vl",
+            "text_config": {"n_shared_experts": 1},
+            "quantization": {
+                "bits": 4,
+                "group_size": 64,
+                "mode": "affine",
+                switch: {
+                    "bits": 4,
+                    "group_size": 16,
+                    "mode": "nvfp4",
+                    "global_scale": True,
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(model_loading, "_MLX_LM_LOAD_CONFIG_PATCHED", False)
+
+    model_loading._patch_mlx_lm_load_config()
+    config = mlx_lm_utils.load_config("unused")
+
+    spec = {"bits": 4, "group_size": 16, "mode": "nvfp4"}
+    assert config["quantization"][switch] == spec
+    assert config["quantization"][f"inner.{switch}"] == spec
+    assert config["text_config"]["routed_expert_scales"] is True
+    assert config["text_config"]["pack_shared_expert"] is False
 
 
 class TestMaterializeLazyState:
