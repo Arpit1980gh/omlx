@@ -255,13 +255,11 @@ def test_minimax_nvfp4_experts_expose_real_weight_and_packed_source(tmp_path):
         config,
         {f"{prefix}.switch_mlp.gate_proj": {"mode": "nvfp4"}},
     )
-    expected_gate = mx.stack([1.0 / globals_[b] for b in bases])
-    assert mx.allclose(vectors[f"{prefix}.switch_mlp.gate_scale"], expected_gate)
+    # mlx-lm layout: only the NVFP4 projection gets a vector, 2688 / G.
+    assert set(vectors) == {f"{prefix}.switch_mlp.gate_proj.global_scale"}
+    expected_gate = mx.stack([2688.0 / globals_[b] for b in bases])
     assert mx.array_equal(
-        vectors[f"{prefix}.switch_mlp.up_scale"], mx.ones((2,))
-    ).item()
-    assert mx.array_equal(
-        vectors[f"{prefix}.switch_mlp.down_scale"], mx.ones((2,))
+        vectors[f"{prefix}.switch_mlp.gate_proj.global_scale"], expected_gate
     ).item()
 
     # The same tensors without the NVFP4 declaration stay untouched.

@@ -4537,6 +4537,12 @@ def _build_model_sanitizer(
                 )
 
                 _vlm_sanitize._omlx_cast_predicate = muse_spark_cast_predicate
+            if model_type in ("minimax_m3", "minimax_m3_vl"):
+                from mlx_vlm.models.minimax_m3_vl.language import (
+                    cast_predicate as minimax_m3_cast_predicate,
+                )
+
+                _vlm_sanitize._omlx_cast_predicate = minimax_m3_cast_predicate
 
             logger.info(
                 f"Using mlx-vlm full sanitize chain for "
@@ -7362,11 +7368,15 @@ def quantize_oq_streaming(
         config
     ) and minimax_nvfp4.has_nvfp4_routed_experts(config)
     if minimax_nvfp4_experts:
-        out_shard_data.update(
-            minimax_nvfp4.routed_expert_scale_tensors(
-                getattr(all_weights, "_lazy", all_weights), config, per_layer_config
-            )
+        scale_tensors = minimax_nvfp4.routed_expert_scale_tensors(
+            getattr(all_weights, "_lazy", all_weights), config, per_layer_config
         )
+        out_shard_data.update(scale_tensors)
+        # mlx-lm applies a projection's global_scale only when its quantization
+        # entry says so.
+        for key in scale_tensors:
+            base = key[: -len(".global_scale")]
+            per_layer_config[base] = {**per_layer_config[base], "global_scale": True}
 
     del all_weights
     mx.synchronize()

@@ -6398,6 +6398,15 @@ class TestMiniMaxSharedExpertLayout:
         assert not _configure_minimax_shared_expert_layout(config, 8)
         assert "pack_shared_expert" not in config["text_config"]
 
+    def test_sanitizer_keeps_router_at_source_precision(self, config):
+        from omlx.oq import _build_model_sanitizer
+
+        predicate = _build_model_sanitizer(config)._omlx_cast_predicate
+        layer = "language_model.model.layers.3.block_sparse_moe"
+        assert predicate(f"{layer}.gate.weight") is False
+        assert predicate(f"{layer}.e_score_correction_bias") is False
+        assert predicate(f"{layer}.switch_mlp.gate_proj.weight") is True
+
     def test_non_minimax_model_is_unchanged(self):
         config = {
             "model_type": "qwen3_moe",

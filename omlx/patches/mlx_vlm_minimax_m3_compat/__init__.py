@@ -277,7 +277,35 @@ def _patch_load_config_and_model(vlm_utils: Any) -> None:
     vlm_utils.load_model = patched_load_model
 
 
+def _adopt_expert_global_scales(config: dict[str, Any]) -> None:
+    """Route mlx-lm ``global_scale`` experts to the scaled MoE block.
+
+    mlx-lm marks NVFP4 experts with a per-expert global scale through
+    ``"global_scale": true`` in their quantization entry. The MoE block applies
+    those scales itself, and ``SwitchLinear.to_quantized`` takes no such
+    argument, so the flag is dropped here. Other models keep it.
+    """
+    if not (
+        _is_minimax_model_type(config.get("model_type"))
+        or _has_minimax_architecture(config)
+    ):
+        return
+    flagged = False
+    for key in ("quantization", "quantization_config"):
+        quantization = config.get(key)
+        if not isinstance(quantization, dict):
+            continue
+        for spec in quantization.values():
+            if isinstance(spec, dict) and spec.pop("global_scale", False):
+                flagged = True
+    text_config = config.get("text_config")
+    if flagged and isinstance(text_config, dict):
+        text_config["pack_shared_expert"] = False
+        text_config["routed_expert_scales"] = True
+
+
 def _normalize_quantization_config(config: dict[str, Any]) -> None:
+    _adopt_expert_global_scales(config)
     quantization_config = config.get("quantization_config")
     text_config = config.get("text_config")
     if quantization_config is None and isinstance(text_config, dict):

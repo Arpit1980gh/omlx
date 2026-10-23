@@ -4,6 +4,10 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from omlx.patches.mlx_vlm_minimax_m3_compat.virtual_nvfp4 import (
+    MLX_NVFP4_GLOBAL_SCALE,
+)
+
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
@@ -60,6 +64,32 @@ def _convert_nvfp4_experts(weights: dict, prefix: str, num_experts: int) -> bool
             weights.pop(f"{base}.input_global_scale", None)
         weights[f"{prefix}.switch_mlp.{mlx_name}_scale"] = mx.stack(inverse_scales)
     return True
+
+
+def _inverse_scales_from_global_scales(
+    weights: dict, prefix: str, num_experts: int
+) -> None:
+    """Turn mlx-lm ``global_scale`` vectors into the MoE block's inverse scales.
+
+    MLX dequantizes nvfp4 with ``global_scale / (6 * 448)``, which is the
+    inverse global scale. A projection without a vector already holds real
+    values, so its scale is one.
+    """
+    switch = f"{prefix}.switch_mlp"
+    # Only quantized MLX experts need this. oQ runs this sanitize on logical
+    # expert weights without .scales, and must not write the ones vectors.
+    if f"{switch}.gate_proj.scales" not in weights:
+        return
+    for name in ("gate", "up", "down"):
+        global_scale = weights.pop(f"{switch}.{name}_proj.global_scale", None)
+        if global_scale is not None:
+            weights[f"{switch}.{name}_scale"] = (
+                global_scale.astype(mx.float32) / MLX_NVFP4_GLOBAL_SCALE
+            )
+        elif f"{switch}.{name}_scale" not in weights:
+            weights[f"{switch}.{name}_scale"] = mx.ones(
+                (num_experts,), dtype=mx.float32
+            )
 
 
 def _sanitize_moe_weights(weights: dict, args):
@@ -132,6 +162,9 @@ def _sanitize_moe_weights(weights: dict, args):
                     weights[f"{prefix}.switch_mlp.{mlx_name}.{suffix}"] = pop_stack(
                         keys
                     )
+
+        if getattr(args, "routed_expert_scales", False):
+            _inverse_scales_from_global_scales(weights, prefix, num_experts)
 
 
 class MiniMaxProjector(nn.Module):

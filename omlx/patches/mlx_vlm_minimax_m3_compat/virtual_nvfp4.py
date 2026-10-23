@@ -21,6 +21,9 @@ import mlx.core as mx
 
 NVFP4_QUANT_INFO = {"kind": "nvfp4", "bits": 4, "group_size": 16, "mode": "nvfp4"}
 
+# MLX dequantizes nvfp4 with global_scale / (6 * 448).
+MLX_NVFP4_GLOBAL_SCALE = 6.0 * 448.0
+
 _PROJ_NAMES = (("w1", "gate"), ("w2", "down"), ("w3", "up"))
 _LAYER_PREFIXES = ("language_model.model.layers", "model.layers")
 
@@ -123,27 +126,28 @@ def _register_projection(index, base: str) -> int:
 
 
 def routed_expert_scale_tensors(index, config, per_layer_config: dict) -> dict:
-    """Per-expert scale vectors that match how each projection was written.
+    """mlx-lm ``global_scale`` vectors of the projections passed through as NVFP4.
 
-    A projection passed through as NVFP4 needs ``1 / weight_global_scale`` at
-    load time. A projection re-quantized from the dequantized weight already
-    holds real values, so its vector is all ones.
+    Each holds ``2688 / weight_global_scale`` per expert, the value mlx-lm
+    writes. A projection re-quantized from the dequantized weight already holds
+    real values and gets no vector.
     """
     num_experts = int(_text_config(config).get("num_local_experts") or 0)
     tensors = {}
     for prefix in _nvfp4_moe_prefixes(index, config):
         for proj, name in _PROJ_NAMES:
-            quant = per_layer_config.get(f"{prefix}.switch_mlp.{name}_proj") or {}
-            if quant.get("mode") == "nvfp4":
-                scale = mx.stack(
-                    [
-                        _inverse_global_scale(
-                            index, f"{prefix}.experts.{e}.{proj}.weight_global_scale"
-                        )
-                        for e in range(num_experts)
-                    ]
-                )
-            else:
-                scale = mx.ones((num_experts,), dtype=mx.float32)
-            tensors[f"{prefix}.switch_mlp.{name}_scale"] = scale
+            switch = f"{prefix}.switch_mlp.{name}_proj"
+            if (per_layer_config.get(switch) or {}).get("mode") != "nvfp4":
+                continue
+            tensors[f"{switch}.global_scale"] = mx.stack(
+                [
+                    MLX_NVFP4_GLOBAL_SCALE
+                    / index.load_source(
+                        f"{prefix}.experts.{e}.{proj}.weight_global_scale"
+                    )
+                    .astype(mx.float32)
+                    .reshape(())
+                    for e in range(num_experts)
+                ]
+            )
     return tensors

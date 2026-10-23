@@ -1570,6 +1570,25 @@ class MiniMaxM3Model(nn.Module):
         return self.norm(h)
 
 
+def cast_predicate(key: str) -> bool:
+    """Whether a weight may take the model dtype.
+
+    The router and the expert scales stay float32, as in the source checkpoint.
+    """
+    keep_fp32 = (
+        "e_score_correction_bias" in key
+        or key.endswith("block_sparse_moe.gate.weight")
+        or key.endswith(
+            (
+                "switch_mlp.gate_scale",
+                "switch_mlp.up_scale",
+                "switch_mlp.down_scale",
+            )
+        )
+    )
+    return not keep_fp32
+
+
 class LanguageModel(nn.Module):
     # Single-row verify forwards reproduce one-token decode arithmetic, so
     # greedy speculative output equals plain decode output.
@@ -1903,21 +1922,7 @@ class LanguageModel(nn.Module):
 
     @property
     def cast_predicate(self):
-        def predicate(k):
-            keep_fp32 = (
-                "e_score_correction_bias" in k
-                or k.endswith("block_sparse_moe.gate.weight")
-                or k.endswith(
-                    (
-                        "switch_mlp.gate_scale",
-                        "switch_mlp.up_scale",
-                        "switch_mlp.down_scale",
-                    )
-                )
-            )
-            return not keep_fp32
-
-        return predicate
+        return cast_predicate
 
     @property
     def quant_predicate(self):

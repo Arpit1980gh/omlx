@@ -219,6 +219,89 @@ def test_minimax_nvfp4_experts_get_per_layer_quantization(tmp_path):
     assert config["text_config"]["routed_expert_scales"] is True
 
 
+def test_minimax_mlx_lm_global_scale_flags_select_scaled_experts(tmp_path):
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    from mlx_vlm.utils import load_config
+
+    switch = "language_model.model.layers.1.block_sparse_moe.switch_mlp"
+    nvfp4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    affine = {"group_size": 64, "bits": 3, "mode": "affine"}
+    quantization = {
+        "group_size": 64,
+        "bits": 3,
+        "mode": "affine",
+        f"{switch}.gate_proj": affine,
+        f"{switch}.down_proj": {**nvfp4, "global_scale": True},
+    }
+    (tmp_path / "minimax").mkdir()
+    (tmp_path / "minimax" / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "minimax_m3_vl",
+                "text_config": {"num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+                "quantization": quantization,
+                "quantization_config": quantization,
+            }
+        )
+    )
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "config.json").write_text(
+        json.dumps({"model_type": "muse_spark", "quantization": quantization})
+    )
+
+    config = load_config(tmp_path / "minimax")
+
+    for key in ("quantization", "quantization_config"):
+        assert config[key][f"{switch}.down_proj"] == nvfp4
+        assert config[key][f"{switch}.gate_proj"] == affine
+    assert config["text_config"]["pack_shared_expert"] is False
+    assert config["text_config"]["routed_expert_scales"] is True
+    # Other models load their global_scale experts themselves.
+    other = load_config(tmp_path / "other")
+    assert other["quantization"][f"{switch}.down_proj"]["global_scale"] is True
+
+
+def test_minimax_global_scale_vectors_become_inverse_scales():
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    from mlx_vlm.models.minimax_m3_vl.minimax_m3_vl import _sanitize_moe_weights
+
+    args = _tiny_text_config(
+        pack_shared_expert=False, routed_expert_scales=True, num_local_experts=4
+    )
+    switch = "language_model.model.layers.0.block_sparse_moe.switch_mlp"
+    global_scale = mx.array([15000.0, 21000.0, 33333.0, 42001.5])
+    weights = {f"{switch}.down_proj.global_scale": global_scale}
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        weights[f"{switch}.{proj}.weight"] = mx.zeros((4, 32, 8), dtype=mx.uint32)
+        weights[f"{switch}.{proj}.scales"] = mx.zeros((4, 32, 4), dtype=mx.uint8)
+
+    _sanitize_moe_weights(weights, args)
+
+    assert f"{switch}.down_proj.global_scale" not in weights
+    assert mx.array_equal(weights[f"{switch}.down_scale"], global_scale / 2688.0).item()
+    for name in ("gate", "up"):
+        assert mx.array_equal(weights[f"{switch}.{name}_scale"], mx.ones((4,))).item()
+
+    # oQ sanitizes logical expert weights, which must not gain ones vectors.
+    logical = {
+        f"{switch}.{proj}.weight": mx.zeros((4, 32, 64))
+        for proj in ("gate_proj", "up_proj", "down_proj")
+    }
+    _sanitize_moe_weights(logical, args)
+    assert not any(key.endswith("_scale") for key in logical)
+
+
 def test_ignored_layer_matching_covers_children():
     from omlx.patches.mlx_vlm_minimax_m3_compat import (
         _is_ignored_layer,
