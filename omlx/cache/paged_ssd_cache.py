@@ -339,6 +339,9 @@ def _cache_compat_signature(
 # Model modules whose forward numerics changed under a dependency update.
 # Blocks written before the change are unsafe for these models only.
 _NUMERICS_REVISIONS = {
+    # oMLX's MiniMax M3 now forms its RMSNorm weights, SwiGLU and expert sum
+    # in float32, so blocks from the earlier forward differ.
+    "mlx_vlm.models.minimax_m3_vl.language": "minimax-f32-1",
     # mlx-lm a63e24c scales the GDN q/k l2norm eps by inv_scale**2.
     "mlx_lm.models.qwen3_5": "gdn-qk-norm-2",
     "mlx_lm.models.qwen3_next": "gdn-qk-norm-2",
