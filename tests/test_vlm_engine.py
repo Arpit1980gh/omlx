@@ -3395,11 +3395,11 @@ class TestCaptureVLMPositionState:
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
-@pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified"])
+@pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified", "muse_spark"])
 @pytest.mark.parametrize(
     "vision_config, with_image", [(None, True), (None, False), ({}, True)]
 )
-async def test_preflight_gemma4_image_support(model_type, vision_config, with_image):
+async def test_preflight_text_only_image_support(model_type, vision_config, with_image):
     from omlx.exceptions import InvalidRequestError
 
     engine = _make_loaded_engine(model_type=model_type)

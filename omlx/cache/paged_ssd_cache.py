@@ -345,6 +345,17 @@ _NUMERICS_REVISIONS = {
     "mlx_lm.models.bailing_hybrid": "gdn-qk-norm-2",
     # omlx.patches.qwen35_gdn_prework applies the same fix to mlx-vlm.
     "mlx_vlm.models.qwen3_5.language": "gdn-qk-norm-2",
+    # mlx-lm 0d4d3d04 changes these forwards: the YaRN ``truncate`` flag of
+    # gpt-oss, ERNIE-4.5 and PhiMoE routing, PLaMo3 YaRN and windows, and the
+    # FP8 Ministral 3 linears.
+    "mlx_lm.models.gpt_oss": "mlx-lm-0d4d3d04",
+    "mlx_lm.models.ernie4_5_moe": "mlx-lm-0d4d3d04",
+    "mlx_lm.models.phimoe": "mlx-lm-0d4d3d04",
+    "mlx_lm.models.plamo3": "mlx-lm-0d4d3d04",
+    "mlx_lm.models.ministral3": "mlx-lm-0d4d3d04",
+    # mlx-lm's Muse Spark keeps the residual stream in FP32; oMLX's own model
+    # served Muse Spark before and kept it in BF16.
+    "mlx_lm.models.muse_spark": "upstream-1",
 }
 
 

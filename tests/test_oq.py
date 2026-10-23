@@ -2632,30 +2632,6 @@ class TestOQImatrixCollector:
         np.testing.assert_allclose(entry.in_sum2[1], np.array([25.0, 36.0, 49.0, 64.0]))
         np.testing.assert_allclose(entry.in_sum2[2], np.array([26.0, 40.0, 58.0, 80.0]))
 
-    @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
-    def test_muse_spark_scaled_experts_are_captured_with_tensor_scales(self):
-        from omlx.patches.muse_spark.muse_spark_model import ScaledSwitchGLU
-
-        mx.random.seed(0)
-        glu = ScaledSwitchGLU(32, 16, 4)
-        for proj in (glu.gate_proj, glu.up_proj, glu.down_proj):
-            proj.global_scale = mx.random.uniform(1.0, 4.0, (4,))
-        x = mx.random.normal((1, 3, 32))
-        indices = mx.array([[[0, 2], [1, 3], [2, 0]]], dtype=mx.int32)
-        expected = glu(x, indices)
-
-        collector = OQImatrixCollector()
-        assert collector.install(glu, name_prefix="mlp.switch_mlp.") == 3
-        got = glu(x, indices)
-        collector.restore(glu)
-
-        # The wrapped projections still apply their NVFP4 tensor scales.
-        assert mx.array_equal(got, expected).item()
-        assert collector.switch_capture_modules == 3
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            counts = collector.entries[f"mlp.switch_mlp.{proj}"].counts
-            np.testing.assert_array_equal(counts, np.array([2, 1, 2, 1]))
-
 
 class TestOQECalibrationData:
     @staticmethod
@@ -3056,6 +3032,23 @@ class TestDiscoverSanitizePlan:
 
         result = _DiscoveredPlan(plan, idx).pop("shared_down.weight")
         np.testing.assert_array_equal(np.array(result), tensor[None, :, :])
+
+    def test_squeeze_sanitize_replays(self, tmp_path):
+        # ERNIE-4.5 MoE stores its correction bias as [1, E] and squeezes it.
+        path = tmp_path / "weights.safetensors"
+        tensor = np.arange(4, dtype=np.float16).reshape(1, 4)
+        _write_safetensors(str(path), {"moe_statics.bias": tensor})
+        idx = _LazyTensorIndex([str(path)])
+
+        def sanitize(weights):
+            bias = weights["moe_statics.bias"]
+            return {"bias": bias.squeeze(0) if bias.ndim == 2 else bias}
+
+        plan = _discover_sanitize_plan(sanitize, idx)
+        assert plan["bias"]["shape"] == (4,)
+
+        result = _DiscoveredPlan(plan, idx).pop("bias")
+        np.testing.assert_array_equal(np.array(result), tensor[0])
 
     def test_minimax_shared_expert_sanitize_replays(self, tmp_path):
         path = tmp_path / "weights.safetensors"
@@ -4393,7 +4386,7 @@ class TestPreQuantizedSource:
         assert mx.array_equal(tid, mx.arange(8, dtype=mx.int32).reshape(2, 4)).item()
 
     def test_muse_spark_nvfp4_experts_pass_through(self, tmp_path):
-        from omlx.patches.muse_spark import muse_spark_model as msm
+        from omlx.patches.muse_spark.oq_layout import sanitize_experts
 
         prefix = "model.language_model.layers.0.mlp.experts."
         rng = np.random.default_rng(0)
@@ -4437,7 +4430,7 @@ class TestPreQuantizedSource:
         assert logical[prefix + "gate_up_proj"] == ((2, 32, 32), "BF16")
         assert prefix + "gate_up_proj_weight_scale" not in logical
 
-        dp = _DiscoveredPlan(_discover_sanitize_plan(msm.sanitize_experts, idx), idx)
+        dp = _DiscoveredPlan(_discover_sanitize_plan(sanitize_experts, idx), idx)
         switch = "model.language_model.layers.0.mlp.switch_mlp."
         # oQ3 requantizes gate/up and folds their tensor scales into the
         # weights; projections passed through as NVFP4 (all of them at oQ4)
@@ -7945,6 +7938,82 @@ class TestStreamedCalibration:
         plan = Plan({skipped: object(), kept: mx.ones((2, 2))})
         items = oq._streamed_layer_items(plan, 1, skip_key=oq._qwen4_exp_mmap_skip_key)
         assert [key for key, _ in items] == ["self_attn.q_proj.weight"]
+
+    @pytest.mark.parametrize("nvfp4", [False, True])
+    def test_muse_spark_collection_matches_resident(self, tmp_path, monkeypatch, nvfp4):
+        """Streamed layers of the HF checkpoint match mlx-lm's loaded model.
+
+        Both name the statistics after oQ's tensors. The NVFP4 experts stream
+        dequantized with their tensor scale folded into BF16 weights, so the
+        statistics after them agree to BF16 precision. At oQ4 both leave the
+        NVFP4 experts out of the sensitivity qdq.
+        """
+        from tests.test_mlx_vlm_muse_glimmer_compat import _spark_oq_source
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        _spark_oq_source(source, nvfp4=nvfp4)
+        config = json.loads((source / "config.json").read_text())
+        tokens = mx.array([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]])
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        monkeypatch.setattr(oq, "load_mlx_lm_tokenizer", lambda *a, **kw: object())
+        model, tokenizer = oq._load_muse_spark_calibration_model(source)
+        resident, _ = oq._collect_imatrix_from_model(
+            model,
+            tokenizer,
+            config,
+            calib_dataset=oq._OQE_CALIB_DATASET,
+            num_samples=2,
+            seq_length=6,
+        )
+        streamed, metadata = oq._collect_imatrix_streaming(
+            source,
+            tokenizer,
+            config,
+            num_samples=2,
+            seq_length=6,
+            calib_data=tokens,
+            measure_sensitivity=True,
+            sensitivity_oq_level=4,
+            sensitivity_num_samples=2,
+            sensitivity_seq_length=6,
+        )
+        attn = "language_model.model.layers.1.self_attn."
+        assert {attn + p for p in ("q_proj", "k_proj", "v_proj", "gate_proj")} <= set(
+            resident
+        )
+        assert "language_model.model.layers.1.mlp.switch_mlp.down_proj" in resident
+        assert resident.keys() == streamed.keys()
+        tolerance = 0.02 if nvfp4 else 1e-5
+        for key, entry in resident.items():
+            np.testing.assert_array_equal(streamed[key].counts, entry.counts)
+            error = np.linalg.norm(streamed[key].in_sum2 - entry.in_sum2)
+            assert error <= tolerance * np.linalg.norm(entry.in_sum2), key
+        reference = oq._measure_sensitivity_from_model(
+            model, tokenizer, config, 4, num_samples=2, seq_length=6
+        )
+        assert metadata["sensitivity_map"].keys() == reference.keys()
+        rel = 0.01 if nvfp4 else 1e-3
+        for key, value in reference.items():
+            assert metadata["sensitivity_map"][key] == pytest.approx(value, rel=rel)
+
+    def test_muse_spark_sensitivity_qdq_skips_passthrough_experts(self, tmp_path):
+        import omlx.oq as oq
+        from omlx.patches.muse_spark import oq_layout
+        from tests.test_mlx_vlm_muse_glimmer_compat import _spark_oq_source
+
+        _spark_oq_source(tmp_path, nvfp4=True)
+        config = json.loads((tmp_path / "config.json").read_text())
+        args = oq_layout.calibration_args(config)
+        # Layer 0 keeps BF16 experts, layer 1 has NVFP4 ones. oQ4 passes those
+        # through unchanged, oQ3 requantizes them.
+        for layer_idx, level, expected in ((0, 4, True), (1, 4, False), (1, 3, True)):
+            block = oq_layout.calibration_block(args, layer_idx)
+            saved = oq._temporary_quantize_block(
+                block, config, level, 64, layer_idx=layer_idx
+            )
+            assert "self_attn.qkvg_proj" in saved
+            assert any(".experts." in path for path in saved) == expected
 
     def test_minimax_collection_matches_resident(self, tmp_path, monkeypatch):
         from dataclasses import asdict
