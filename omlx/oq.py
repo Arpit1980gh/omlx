@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import struct as _struct
+import sys
 import tempfile
 import time as _time
 from dataclasses import dataclass
@@ -4538,11 +4539,14 @@ def _build_model_sanitizer(
 
                 _vlm_sanitize._omlx_cast_predicate = muse_spark_cast_predicate
             if model_type in ("minimax_m3", "minimax_m3_vl"):
-                from mlx_vlm.models.minimax_m3_vl.language import (
-                    cast_predicate as minimax_m3_cast_predicate,
-                )
-
-                _vlm_sanitize._omlx_cast_predicate = minimax_m3_cast_predicate
+                # Take the predicate from the language module the config
+                # resolved to. Importing it by name could load upstream
+                # mlx-vlm's module of the same name ahead of the vendored one.
+                language_cls = getattr(model_module, "LanguageModel", None)
+                language = sys.modules.get(getattr(language_cls, "__module__", ""))
+                predicate = getattr(language, "cast_predicate", None)
+                if predicate is not None:
+                    _vlm_sanitize._omlx_cast_predicate = predicate
 
             logger.info(
                 f"Using mlx-vlm full sanitize chain for "
