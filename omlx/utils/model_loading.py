@@ -577,6 +577,19 @@ def maybe_apply_pre_load_patches(
 
     set_mtp_active(False)
 
+    # Same for the mlx-vlm attach flag: the patched Qwen3.5 classes read it, also
+    # in VLMs outside the MTP branch below (minicpmv4_7). Exports that declare
+    # MTP heads without mtp.* weights (issue #1426) fail strict load if attached.
+    has_mtp_weights = False
+    if for_vlm:
+        try:
+            from ..patches.mlx_vlm_mtp import set_mtp_attach_enabled
+        except Exception:
+            pass
+        else:
+            has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
+            set_mtp_attach_enabled(has_mtp_weights)
+
     _patch_mlx_lm_load_config()
 
     # Machine-conditioned, model-independent: reroute sorted gather_qmm
@@ -1029,24 +1042,10 @@ def maybe_apply_pre_load_patches(
                 from ..patches.mlx_vlm_mtp import (
                     apply_mlx_vlm_mtp_patch,
                     apply_mlx_vlm_mtp_runtime_patch,
-                    set_mtp_attach_enabled,
                 )
             except Exception:
                 pass
             else:
-                # Decide attach-vs-skip BEFORE applying the runtime patch
-                # because the patch wraps ``LanguageModel.__init__`` which
-                # reads the flag at instantiation. Some Qwen3.6 MoE VLM
-                # exports (unsloth UD MLX builds, issue #1426) declare
-                # ``mtp_num_hidden_layers > 0`` in config.json but ship no
-                # ``mtp.*`` weights; attaching MTPModule there causes
-                # strict load_weights to fail with "Missing N parameters"
-                # and silently downgrade the engine to LLM, dropping
-                # vision. Scan the index for actual mtp.* keys and skip
-                # attachment when they're absent.
-                has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
-                set_mtp_attach_enabled(has_mtp_weights)
-
                 # Sanitize-preservation patch runs unconditionally: the
                 # stock mlx-vlm Model.sanitize strips every ``mtp.*`` key,
                 # so without this an MTP head with persisted weights would

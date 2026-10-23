@@ -462,6 +462,24 @@ class TestVlmMtpPreLoadDispatch:
         attach_mock.assert_called_once_with(False)
         assert calls == ["attach=False", "sanitize", "runtime"]
 
+    def test_vlm_attach_follows_weights_outside_mtp_branch(self, tmp_path, monkeypatch):
+        # MiniCPM-V 4.7 builds its language model from the patched Qwen3.5
+        # MoE classes but is not an MTP-compatible model_type. Without a
+        # reset it reuses the attach flag of the previous VLM load.
+        _, _, runtime_mock, attach_mock = self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "minicpmv4_7", "vision_config": {}, '
+            '"text_config": {"model_type": "qwen3_5_moe_text", '
+            '"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=False)
+
+        maybe_apply_pre_load_patches(path, for_vlm=True)
+
+        attach_mock.assert_called_once_with(False)
+        runtime_mock.assert_not_called()
+
     def test_vlm_patches_skipped_when_not_for_vlm(self, tmp_path, monkeypatch):
         # BatchedEngine / LLM loader paths must NOT touch
         # mlx-vlm classes even when the model declares MTP heads. for_vlm
@@ -629,7 +647,8 @@ class TestVlmMtpPreLoadDispatch:
 
     def test_gemma4_without_mtp_heads_skips_mtp_patches(self, tmp_path, monkeypatch):
         # Plain gemma4 VLMs (no merged assistant) must stay untouched by
-        # the MTP dispatch — no declared heads, no runtime patch.
+        # the MTP dispatch — no declared heads, no runtime patch. The attach
+        # flag is still reset so a previous load cannot leak into this one.
         calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
             monkeypatch
         )
@@ -642,7 +661,7 @@ class TestVlmMtpPreLoadDispatch:
         maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
 
         runtime_mock.assert_not_called()
-        attach_mock.assert_not_called()
+        attach_mock.assert_called_once_with(False)
         assert "runtime" not in calls
 
     def test_qwen36_moe_vlm_sanitize_when_no_mtp_heads(self, tmp_path, monkeypatch):
@@ -663,7 +682,7 @@ class TestVlmMtpPreLoadDispatch:
 
         sanitize_mock.assert_called_once()
         runtime_mock.assert_not_called()
-        assert calls == ["sanitize"]
+        assert calls == ["attach=False", "sanitize"]
 
     def test_qwen36_moe_vlm_sanitize_skipped_without_for_vlm(
         self, tmp_path, monkeypatch
