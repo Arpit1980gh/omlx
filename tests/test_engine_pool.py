@@ -1762,8 +1762,6 @@ class TestEnginePoolAsync:
     async def test_minimax_bundled_dspark_is_charged_and_takes_the_mtp_depth(
         self, pool_with_mock_engines, small_mock_model_dir
     ):
-        """MiniMax M3.1 ships its DSpark draft in ``dspark/``; Lightning MTP
-        loads it, so the projection charges its weights and context rings."""
         pool = pool_with_mock_engines
         pool._scheduler_config.max_num_seqs = 8
         entry = pool.get_entry("model-a")
@@ -1771,7 +1769,6 @@ class TestEnginePoolAsync:
         draft_path = small_mock_model_dir / "model-a" / "dspark"
         draft_path.mkdir()
         text_config = {
-            "architectures": ["DSparkMiniMaxDraftModel"],
             "hidden_size": 64,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,

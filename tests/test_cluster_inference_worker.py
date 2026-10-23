@@ -138,7 +138,6 @@ def test_distributed_minimax_protocol_replaces_generic_tool_and_thinking_markers
         _think_end = "</think>"
         _think_start_tokens = (54,)
         _think_end_tokens = (55,)
-        # The release template has no thinking_mode.
         chat_template = "{%- set think_begin_token = '<mm:think>' -%}"
 
         @staticmethod

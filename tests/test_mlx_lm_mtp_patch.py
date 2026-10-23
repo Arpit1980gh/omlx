@@ -3760,7 +3760,6 @@ def test_block_drafter_matches_standard_and_feeds_committed_context(
 
 @pytest.mark.parametrize("wrong", [None, 0, 3])
 def test_block_drafter_copies_keep_output_and_context(monkeypatch, wrong):
-    """Context copies replace a block drafter's block without changing output."""
     from omlx.patches.mlx_lm_mtp import context_copy
 
     prompt, limit = [1, 2], 30

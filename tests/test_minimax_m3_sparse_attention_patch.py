@@ -46,7 +46,7 @@ def _reference_blocks(idx_q, idx_k, qpos, pad):
     return result
 
 
-def _reference_attention(q, k, v, blocks, qpos, pad, scale):
+def _reference_attention(q, k, v, blocks, qpos, pad, scale, keep=None, block=BLOCK):
     batch, heads, length, _ = q.shape
     kv_heads = k.shape[1]
     out = np.zeros_like(q)
@@ -58,8 +58,8 @@ def _reference_attention(q, k, v, blocks, qpos, pad, scale):
                 cols = [
                     pad[b] + j
                     for blk in blocks[(b, h, t)]
-                    for j in range(blk * BLOCK, (blk + 1) * BLOCK)
-                    if j <= p
+                    for j in range(blk * block, (blk + 1) * block)
+                    if j <= p and (keep is None or keep[b, 0, t, pad[b] + j])
                 ]
                 logits = scale * (k[b, h, cols] @ q[b, qh, t])
                 weights = np.exp(logits - logits.max())
@@ -537,21 +537,9 @@ def test_small_l_sparse_attention_kernel_matches_reference(language):
     assert out is not None
 
     q32, k32, v32 = (np.array(x.astype(mx.float32)) for x in (q, k, v))
-    ids = np.array(block_ids)
-    expected = np.zeros_like(q32)
-    for b in range(batch):
-        for qh in range(heads):
-            h = qh // (heads // kv_heads)
-            for t in range(length):
-                cols = [
-                    pad[b] + j
-                    for blk in ids[b, h, t]
-                    for j in range(blk * block, (blk + 1) * block)
-                    if j <= qpos[b, t] and keep[b, 0, t, pad[b] + j]
-                ]
-                logits = scale * (k32[b, h, cols] @ q32[b, qh, t])
-                weights = np.exp(logits - logits.max())
-                expected[b, qh, t] = (weights / weights.sum()) @ v32[b, h, cols]
+    expected = _reference_attention(
+        q32, k32, v32, np.array(block_ids), qpos, pad, scale, keep, block
+    )
     np.testing.assert_allclose(
         np.array(out.astype(mx.float32)), expected, atol=2e-2, rtol=2e-2
     )

@@ -679,7 +679,6 @@ def test_short_context_matches_reference_draft_block(make_drafter, longest):
             [(SimpleNamespace(uid=0), row, context, anchor, None)]
         )[0][0]
         if isinstance(got, list):
-            # DSpark proposals come as one lazy token per position.
             got = mx.concatenate(got)[None]
         assert got.tolist() == expected.tolist()
 
@@ -1051,7 +1050,6 @@ def test_minimax_dspark_sanitize_maps_checkpoint_layout():
 
 
 def test_dspark_context_only_cycle_keeps_the_next_block():
-    """A copy cycle only queues its rows; the next drafted block is unchanged."""
     first, second = _captured(5, seed=31), _captured(4, seed=32)
     anchors = (mx.array([7], dtype=mx.uint32), mx.array([12], dtype=mx.uint32))
 
@@ -1069,7 +1067,6 @@ def test_dspark_context_only_cycle_keeps_the_next_block():
 
 
 def test_minimax_dspark_depth_verifies_a_prefix_of_the_trained_block():
-    """A depth setting caps the proposals, not the block they are drafted in."""
     captured, anchor = _captured(5, seed=33), mx.array([7], dtype=mx.uint32)
     full = _tiny_minimax_dspark()
     capped = _tiny_minimax_dspark(depth=2, fixed=True)
@@ -1084,7 +1081,6 @@ def test_minimax_dspark_depth_verifies_a_prefix_of_the_trained_block():
 
 
 def test_dspark_context_only_cycles_queue_at_most_one_ring():
-    """Consecutive copy cycles keep only the rows the ring can attend."""
     drafter = _tiny_minimax_dspark()
     state = SimpleNamespace(uid=0, depth=BLOCK, controller=None)
     for cycle in range(6):
