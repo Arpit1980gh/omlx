@@ -494,6 +494,30 @@ def _config_model_type(config: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+# The release template is always adaptive and has no thinking_mode, but its
+# instructions still mark a disabled turn by the </mm:think> prefix and an
+# enabled one by <mm:think>. Its last output is the generation prompt, so this
+# block restores the prefixes the earlier template rendered for thinking_mode.
+_THINKING_MODE_PREFIX = (
+    "{%- if add_generation_prompt and thinking_mode is defined -%}"
+    "{%- if thinking_mode == 'disabled' -%}</mm:think>"
+    "{%- elif thinking_mode == 'enabled' -%}<mm:think>"
+    "{%- endif -%}"
+    "{%- endif -%}"
+)
+
+
+def minimax_thinking_mode_template(template: Any) -> Any:
+    """Return a MiniMax M3 chat template that renders ``thinking_mode``."""
+    if (
+        not isinstance(template, str)
+        or "<mm:think>" not in template
+        or "thinking_mode" in template
+    ):
+        return template
+    return template + _THINKING_MODE_PREFIX
+
+
 def _apply_minimax_thinking_kwargs(kwargs: dict[str, Any]) -> None:
     enable_thinking = kwargs.pop("enable_thinking", None)
     if "thinking_mode" in kwargs:

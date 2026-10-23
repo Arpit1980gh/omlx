@@ -302,6 +302,36 @@ def test_minimax_global_scale_vectors_become_inverse_scales():
     assert not any(key.endswith("_scale") for key in logical)
 
 
+def test_minimax_release_template_renders_thinking_mode():
+    jinja2 = pytest.importorskip("jinja2")
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        minimax_thinking_mode_template,
+    )
+
+    # Like the release template: no thinking_mode, generation prompt last.
+    release = (
+        "{%- set think_begin_token = '<mm:think>' -%}"
+        "{{- 'user\\n' }}"
+        "{%- if add_generation_prompt -%}{{- 'ai\\n' }}{%- endif -%}"
+    )
+    template = jinja2.Environment().from_string(minimax_thinking_mode_template(release))
+
+    def render(**kwargs):
+        return template.render(add_generation_prompt=True, **kwargs)
+
+    assert render() == "user\nai\n"
+    assert render(thinking_mode="adaptive") == "user\nai\n"
+    assert render(thinking_mode="disabled") == "user\nai\n</mm:think>"
+    assert render(thinking_mode="enabled") == "user\nai\n<mm:think>"
+    assert (
+        template.render(add_generation_prompt=False, thinking_mode="disabled")
+        == "user\n"
+    )
+    # A template that renders thinking_mode itself stays as it is.
+    earlier = release + "{{ thinking_mode }}"
+    assert minimax_thinking_mode_template(earlier) == earlier
+
+
 def test_ignored_layer_matching_covers_children():
     from omlx.patches.mlx_vlm_minimax_m3_compat import (
         _is_ignored_layer,
