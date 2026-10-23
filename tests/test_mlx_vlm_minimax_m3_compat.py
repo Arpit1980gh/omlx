@@ -483,6 +483,11 @@ def test_omlx_loader_respects_minimax_shared_expert_layout_override():
 
 def test_minimax_dspark_runtime_returns_captures_and_rolls_back():
     mx = pytest.importorskip("mlx.core")
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
     from mlx_vlm.models.minimax_m3_vl.language import LanguageModel
 
     args = _tiny_text_config(
@@ -512,3 +517,71 @@ def test_minimax_dspark_runtime_returns_captures_and_rolls_back():
     assert lm.mtp_partial_rollback(cache, 1, 3)
     assert cache[0].offset == 3
     assert cache[0].index_offset == 3
+
+
+def test_minimax_batch_verify_rollback_keeps_each_rows_accepted_prefix():
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+    from mlx_vlm.models.minimax_m3_vl.language import (
+        LanguageModel,
+        MiniMaxM3BatchKVCache,
+    )
+
+    args = _tiny_text_config(
+        pack_shared_expert=False,
+        num_hidden_layers=2,
+        moe_layer_freq=[0, 0],
+        vocab_size=64,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [1, 1],
+            "sparse_index_dim": 16,
+            "sparse_num_index_heads": 1,
+            "sparse_block_size": 8,
+            "sparse_topk_blocks": 2,
+        },
+    )
+    lm = LanguageModel(args)
+    # Rows of different lengths, merged with left padding like a generation batch.
+    rows = []
+    for n in (5, 9):
+        cache = lm.make_cache()
+        lm(mx.arange(1, n + 1)[None], cache=cache)
+        rows.append(cache)
+    batch = [
+        MiniMaxM3BatchKVCache.merge([row[layer] for row in rows])
+        for layer in range(len(rows[0]))
+    ]
+    block, accepted = 4, [2, 0]
+    out = lm(
+        mx.array([[11, 12, 13, 14], [21, 22, 23, 24]]),
+        cache=batch,
+        return_hidden=True,
+    )
+    assert out.gdn_states == []
+    # Reference: each row's cache after the verify, trimmed on its own.
+    expected = []
+    for row, count in enumerate(accepted):
+        caches = [layer.extract(row) for layer in batch]
+        for cache in caches:
+            cache.trim(block - count - 1)
+        expected.append(caches)
+
+    assert lm.rollback_speculative_cache(batch, out.gdn_states, accepted, block) == 2
+    for row, caches in enumerate(expected):
+        for layer, want in zip(batch, caches):
+            got = layer.extract(row)
+            assert got.offset == want.offset
+            n = want.offset
+            for name in ("keys", "values"):
+                a = getattr(got.kv_cache, name)[..., :n, :]
+                b = getattr(want.kv_cache, name)[..., :n, :]
+                assert mx.array_equal(a, b).item()
+            assert mx.array_equal(
+                got.index_keys[..., : got.index_offset, :],
+                want.index_keys[..., : want.index_offset, :],
+            ).item()

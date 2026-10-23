@@ -144,9 +144,6 @@ class DFlashDrafter:
         # running, so a plain forward can be attributed to rows.
         self.scope_uids: tuple | None = None
         self._predraft: _Predraft | None = None
-        # Targets whose batch caches cannot roll rows back separately verify
-        # each row against its own extracted cache.
-        self.independent_verify = False
         # Sliding-window draft layers: block query j attends the context
         # window ending at its own position instead of the block's start.
         self.query_windows = False

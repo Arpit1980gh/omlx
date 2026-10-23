@@ -535,6 +535,9 @@ class MiniMaxM3KVCache:
 
 
 class MiniMaxM3BatchKVCache:
+    # LanguageModel.rollback_speculative_cache keeps each row's accepted
+    # prefix in place, so a batch verify needs no per-row cache copies.
+    _omlx_mtp_batch_rollback_cache = True
     step = BatchKVCache.step
 
     def __init__(self, left_padding):
@@ -1824,7 +1827,9 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_states,
-            gdn_states=None,
+            # No recurrent state to restore, but a verify forward is rolled
+            # back through rollback_speculative_cache, per row in a batch.
+            gdn_states=[] if return_hidden else None,
             shared_kv_states={} if return_shared_kv else None,
         )
 
@@ -1852,55 +1857,31 @@ class LanguageModel(nn.Module):
         accepted: Any,
         block_size: int,
     ) -> int:
+        """Keep each row's accepted prefix of a ``block_size``-token verify.
+
+        Every layer drops the positions no row kept. A row that kept fewer
+        turns its rejected tail into left padding (the batch cache's
+        right-padding roll), so later attention never sees those keys; the
+        index keys roll with the KV.
+        """
         del gdn_states
-        if isinstance(accepted, int):
-            accepted = mx.array([accepted])
-        elif not isinstance(accepted, mx.array):
-            accepted = mx.array(accepted)
-        if accepted.ndim == 0:
-            accepted = accepted.reshape(1)
-
-        max_a = int(accepted.max().item())
-        n = max_a + 1
-        trim = int(block_size) - n
-        is_batch = accepted.size > 1
-        valid_ends = accepted + 1
-
+        if isinstance(accepted, mx.array):
+            accepted = accepted.reshape(-1).tolist()
+        elif isinstance(accepted, int):
+            accepted = [accepted]
+        kept = [int(a) + 1 for a in accepted]
+        max_kept = max(kept)
+        uniform = int(block_size) - max_kept
+        extra = [max_kept - k for k in kept]
         for cache in caches:
             if cache is None:
                 continue
-
-            if trim > 0 and hasattr(cache, "trim"):
-                cache.trim(trim)
-
-            if not is_batch or not hasattr(cache, "_idx"):
-                continue
-
-            kv_len = int(cache._idx)
-            verify_start = kv_len - n
-            if verify_start < 0:
-                continue
-            valid_ends_list = [int(v) for v in valid_ends.tolist()]
-
-            kv_cache = getattr(cache, "kv_cache", cache)
-            if getattr(kv_cache, "keys", None) is not None:
-                for bi, valid_end in enumerate(valid_ends_list):
-                    start = verify_start + valid_end
-                    if start < kv_len:
-                        kv_cache.keys[bi, :, start:kv_len, :] = 0
-                        kv_cache.values[bi, :, start:kv_len, :] = 0
-
-            index_keys = getattr(cache, "index_keys", None)
-            if index_keys is not None:
-                idx_len = int(getattr(cache, "index_offset", kv_len))
-                idx_verify_start = idx_len - n
-                if idx_verify_start < 0:
-                    continue
-                for bi, valid_end in enumerate(valid_ends_list):
-                    start = idx_verify_start + valid_end
-                    if start < idx_len:
-                        cache.index_keys[bi, :, start:idx_len, :] = 0
-        return max_a
+            if uniform > 0:
+                cache.trim(uniform)
+            if any(extra):
+                cache.prepare(right_padding=extra)
+                cache.finalize()
+        return max_kept - 1
 
     @property
     def layers(self):

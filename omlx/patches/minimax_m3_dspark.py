@@ -293,9 +293,6 @@ def wrap_minimax_dspark(
     )
     if depth:
         drafter.depth = max(1, min(drafter.depth, int(depth)))
-    # MiniMax batch caches trim every row by the same amount, so rows with
-    # different acceptance verify against their own extracted caches.
-    drafter.independent_verify = True
     drafter.query_windows = True
     drafter.context_copy = True
     return drafter
