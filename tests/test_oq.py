@@ -1652,6 +1652,21 @@ class TestLevelBudgetPlan:
         layers = [p for p in shapes if p != "lm_head"]
         assert min(plan.boost_map.get(p, {"bits": 2})["bits"] for p in layers) >= 3
 
+    def test_dense_floor_uses_default_group_when_128_does_not_divide(self):
+        # Group 128 cannot split a 960-wide input, so it would export unquantized.
+        shapes = {"lm_head": (2048, 960)}
+        for i in range(8):
+            shapes[f"model.layers.{i}.self_attn.q_proj"] = (960, 960)
+            shapes[f"model.layers.{i}.mlp.down_proj"] = (960, 2560)
+        config = {"num_hidden_layers": 8, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            shapes, config, 2.5, target_bpw=3.1, hard_cap_bpw=3.3
+        )
+        q = plan.boost_map["model.layers.0.self_attn.q_proj"]
+        down = plan.boost_map["model.layers.0.mlp.down_proj"]
+        assert (q["bits"], q["group_size"]) == (3, 64)
+        assert (down["bits"], down["group_size"]) == (3, 128)
+
     def test_dense_floor_skips_models_with_passthrough_experts(self):
         # Experts kept in source precision never reach the budget, but the
         # config still marks the model as MoE.

@@ -1052,7 +1052,8 @@ def _routed_expert_projection(path: str) -> str | None:
 _MANDATORY_BOOST_PATTERNS = ("lm_head", "embeddings", "embed_tokens", "wte")
 
 # Dense models below 3-bit lift every decoder tensor to this floor first;
-# wider groups keep it inside the low-level budgets.
+# wider groups keep it inside the low-level budgets. Widths that 128 does not
+# divide use the default group, which would otherwise leave them unquantized.
 _DENSE_FLOOR_BITS = 3
 _DENSE_FLOOR_GROUP_SIZE = 128
 # MoE always-on tensors climb these widths one step per round.
@@ -1068,6 +1069,26 @@ def _is_always_on_tensor(path: str) -> bool:
     if _is_routed_expert(path) or _is_vision_tensor(path) or _is_audio_tensor(path):
         return False
     return not any(p in path for p in _MANDATORY_BOOST_PATTERNS)
+
+
+def _always_on_candidates(
+    named_shapes: dict[str, tuple],
+    config: dict,
+    oq_level: float,
+    fixed_overrides: dict[str, dict],
+    layer_scores: dict,
+) -> list[tuple[str, tuple]]:
+    """Quantized always-on tensors as (path, shape), most sensitive layer first."""
+    pred_config = {**config, "_oq_boost_map": {}}
+    found = []
+    for path, shape in named_shapes.items():
+        if path in fixed_overrides or not _is_always_on_tensor(path):
+            continue
+        if universal_quant_predicate(path, None, pred_config, oq_level) is False:
+            continue
+        score = float(layer_scores.get(str(_extract_layer_index(path)), 0.0))
+        found.append((score, path, shape))
+    return [(path, shape) for _, path, shape in sorted(found, key=lambda x: -x[0])]
 
 
 def _mandatory_head_bits(
@@ -1362,25 +1383,19 @@ def _build_quant_plan(
     # through, so lift them to 3-bit with wider groups before any boost.
     # Most sensitive layers go first in case the cap stops the pass early.
     if always_on_rules and not is_moe and base_bits < 3:
-        dense_floor = []
-        for path, shape in named_shapes.items():
-            if path in boost_map or path in fixed_overrides:
+        for path, shape in _always_on_candidates(
+            named_shapes, config, oq_level, fixed_overrides, layer_scores
+        ):
+            if path in boost_map:
                 continue
-            if not _is_always_on_tensor(path):
-                continue
-            pred = universal_quant_predicate(
-                path, module, {**config, "_oq_boost_map": {}}, oq_level
-            )
-            if pred is False:
-                continue
-            score = float(layer_scores.get(str(_extract_layer_index(path)), 0.0))
-            dense_floor.append((score, path, shape))
-        for _score, path, shape in sorted(dense_floor, key=lambda x: -x[0]):
+            floor_gs = _DENSE_FLOOR_GROUP_SIZE
+            if shape[-1] % floor_gs:
+                floor_gs = _OQ_DEFAULT_GROUP_SIZE
             old_cost = _tensor_quantized_bytes(
                 shape, base_bits, base_group_size, base_mode
             )
             new_cost = _tensor_quantized_bytes(
-                shape, _DENSE_FLOOR_BITS, _DENSE_FLOOR_GROUP_SIZE, "affine"
+                shape, _DENSE_FLOOR_BITS, floor_gs, "affine"
             )
             delta = 8 * (new_cost - old_cost)
             next_bpw = (total_bits_f + delta) / total_params
@@ -1388,7 +1403,7 @@ def _build_quant_plan(
                 continue
             boost_map[path] = {
                 "bits": _DENSE_FLOOR_BITS,
-                "group_size": _DENSE_FLOOR_GROUP_SIZE,
+                "group_size": floor_gs,
                 "mode": "affine",
             }
             total_bits_f += delta
@@ -1437,22 +1452,13 @@ def _build_quant_plan(
     # protection floor, raise them one step per round, most sensitive first:
     # spreading the budget beats a few 8-bit tensors next to low-bit ones.
     if always_on_rules and expert_params > 0:
-        always_on = []
-        for path, shape in named_shapes.items():
-            if path in fixed_overrides or not _is_always_on_tensor(path):
-                continue
-            pred = universal_quant_predicate(
-                path, module, {**config, "_oq_boost_map": {}}, oq_level
-            )
-            if pred is False:
-                continue
-            score = float(layer_scores.get(str(_extract_layer_index(path)), 0.0))
-            always_on.append((score, path, shape))
-        always_on.sort(key=lambda x: -x[0])
+        always_on = _always_on_candidates(
+            named_shapes, config, oq_level, fixed_overrides, layer_scores
+        )
         raised = True
         while raised:
             raised = False
-            for _score, path, shape in always_on:
+            for path, shape in always_on:
                 cur = boost_map.get(path) or {
                     "bits": base_bits,
                     "group_size": base_group_size,
