@@ -33,6 +33,7 @@ try:
     import mlx.nn as nn
     from mlx.utils import tree_flatten, tree_unflatten
     from mlx_lm.models.base import create_attention_mask
+    from mlx_lm.utils import _get_classes
 
     from omlx.patches import minimax_m3_dspark as minimax_dspark
     from omlx.patches.mlx_vlm_minimax_m3_compat import virtual_nvfp4 as minimax_nvfp4
@@ -40,6 +41,15 @@ try:
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
+
+try:
+    from mlx_lm.tokenizer_utils import load as load_mlx_lm_tokenizer
+    from mlx_lm.utils import load_model
+
+    from omlx.patches.muse_spark import model as muse_spark_serving
+    from omlx.patches.muse_spark import oq_layout as muse_spark_layout
+except ImportError:
+    muse_spark_layout = muse_spark_serving = None
 
 from omlx.model_discovery import (
     D3_DECISION_CONFIG,
@@ -81,14 +91,13 @@ def _is_qwen4_exp_config(config: dict) -> bool:
     )
 
 
+def _is_muse_spark(config: dict) -> bool:
+    return str(config.get("model_type", "")).lower() == "muse_spark"
+
+
 def _is_muse_spark_modelopt_nvfp4(config: dict) -> bool:
     """Return whether *config* is a Muse Spark ModelOpt NVFP4 export."""
-    quant = config.get("quantization_config") or {}
-    return (
-        str(config.get("model_type", "")).lower() == "muse_spark"
-        and quant.get("quant_method") == "modelopt"
-        and quant.get("quant_algo") == "NVFP4"
-    )
+    return _is_muse_spark(config) and muse_spark_layout.is_modelopt_nvfp4(config)
 
 
 def _muse_spark_passthrough_capture_skip(
@@ -101,21 +110,20 @@ def _muse_spark_passthrough_capture_skip(
     """
     if not _is_muse_spark_modelopt_nvfp4(config):
         return frozenset()
-    from omlx.patches.muse_spark.muse_spark_model import (
-        ModelArgs,
-        modelopt_nvfp4_expert_layers,
-    )
-
     floor_config = {**config, "_oq_boost_map": {}}
     names = set()
-    for i in modelopt_nvfp4_expert_layers(ModelArgs.from_dict(config)):
+    for i in muse_spark_layout.modelopt_nvfp4_expert_layers(config):
         for proj in ("gate_proj", "up_proj", "down_proj"):
             name = f"language_model.model.layers.{i}.mlp.switch_mlp.{proj}"
             bits, _, _ = _get_predicate_bits(
                 f"{name}.weight", floor_config, oq_level, group_size
             )
             if bits is not None and bits >= 4:
+                # Calibration names the experts as mlx-lm's model does,
+                # per layer (streamed) or from the model root (resident).
                 names.add(name)
+                names.add(f"language_model.model.layers.{i}.mlp.experts.{proj}")
+                names.add(f"model.language_model.layers.{i}.mlp.experts.{proj}")
     return frozenset(names)
 
 
@@ -200,9 +208,9 @@ def _unify_shared_bits(
 
 def _fold_nvfp4_tensor_scale(weight: mx.array, global_scale: mx.array) -> mx.array:
     """Scale each expert of a dequantized NVFP4 weight to its real magnitude."""
-    from omlx.patches.muse_spark.muse_spark_model import _NVFP4_GLOBAL_SCALE
-
-    scale = global_scale.astype(mx.float32) * (1.0 / _NVFP4_GLOBAL_SCALE)
+    scale = global_scale.astype(mx.float32) * (
+        1.0 / muse_spark_layout.NVFP4_GLOBAL_SCALE
+    )
     return (weight.astype(mx.float32) * scale[:, None, None]).astype(weight.dtype)
 
 
@@ -2597,6 +2605,18 @@ class _TrackedTensor:
             recipe=list(self.recipe) + [("reshape", shape)],
         )
 
+    def squeeze(self, axis=None):
+        # Recorded as the equivalent reshape, which replay already supports.
+        if axis is None:
+            axes = {i for i, d in enumerate(self.shape) if d == 1}
+        else:
+            axes = (axis,) if isinstance(axis, int) else axis
+            axes = {a % self.ndim for a in axes}
+            if any(self.shape[a] != 1 for a in axes):
+                raise ValueError("cannot squeeze an axis whose size is not 1")
+        shape = tuple(d for i, d in enumerate(self.shape) if i not in axes)
+        return self.reshape(shape)
+
     def astype(self, dtype):
         if self.transform == "nested_unreplayable":
             return self._unreplayable(dtype=dtype)
@@ -4297,6 +4317,8 @@ def _build_model_sanitizer(
         A function that takes a dict of weights and returns sanitized weights,
         or None if the model class can't be loaded.
     """
+    if _is_muse_spark(config):
+        return muse_spark_layout.sanitizer(config, text_only=text_only)
     architectures = config.get("architectures", [])
     # Detect VLMs by the canonical vision-subconfig predicate (used everywhere
     # else in oq.py), not just the ForConditionalGeneration arch name. OCR VLMs
@@ -4363,14 +4385,6 @@ def _build_model_sanitizer(
                     )
 
                     apply_mlx_vlm_muse_glimmer_compat_patch()
-                if model_type == "muse_spark":
-                    from omlx.patches.mlx_vlm_muse_spark_compat import (
-                        apply_mlx_vlm_muse_spark_compat_patch,
-                    )
-                    from omlx.patches.muse_spark import apply_muse_spark_patch
-
-                    apply_muse_spark_patch()
-                    apply_mlx_vlm_muse_spark_compat_patch()
                 if model_type == "glm5_next":
                     from omlx.patches.mlx_vlm_glm5_next_compat import (
                         apply_mlx_vlm_glm5_next_compat_patch,
@@ -4532,12 +4546,6 @@ def _build_model_sanitizer(
                 )
 
                 _vlm_sanitize._omlx_cast_predicate = glm5_next_cast_predicate
-            if model_type == "muse_spark":
-                from omlx.patches.muse_spark.muse_spark_model import (
-                    cast_predicate as muse_spark_cast_predicate,
-                )
-
-                _vlm_sanitize._omlx_cast_predicate = muse_spark_cast_predicate
             if model_type in ("minimax_m3", "minimax_m3_vl"):
                 # Take the predicate from the language module the config
                 # resolved to. Importing it by name could load upstream
@@ -4558,8 +4566,6 @@ def _build_model_sanitizer(
             logger.warning(f"mlx-vlm sanitizer not available for a VLM config: {e}")
 
     try:
-        from mlx_lm.utils import _get_classes
-
         if config.get("model_type") == "glm_moe_dsa":
             try:
                 from omlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
@@ -4768,8 +4774,6 @@ def _build_non_quantizable_set(config: dict) -> set:
     quantization. Returns empty set if the model class cannot be loaded.
     """
     try:
-        from mlx_lm.utils import _get_classes
-
         model_class, model_args_class = _get_classes(config)
         args = model_args_class.from_dict(config)
         model = model_class(args)
@@ -7165,11 +7169,12 @@ def quantize_oq_streaming(
     pending_scales = {}
     consumed_scales = set()
     upstream_writer = None
-    if _stream_source_model_type(config) == "muse_spark":
-        from omlx.patches.muse_spark.upstream_layout import UpstreamWriter
-
-        # The output loads in mlx-lm's own Muse Spark model as well as oMLX.
-        upstream_writer = UpstreamWriter(config)
+    if _is_muse_spark(config):
+        # oMLX serves Muse Spark with mlx-lm's model, so write its layout.
+        upstream_writer = muse_spark_layout.UpstreamWriter(
+            config,
+            centered_norms=not muse_spark_layout.is_upstream_layout(all_weights.keys()),
+        )
 
     for tensor_name in tensor_names:
         if tensor_name in folded_scales:
@@ -7530,14 +7535,7 @@ _OQE_MAX_SAMPLE_MULTIPLIER = 8
 _OQE_MAX_ADAPTIVE_SAMPLES = 1024
 _OQE_MIN_EXPERT_COUNT = 16
 _OQE_MIN_EXPERT_COUNT_PERCENTILE = 5
-# ScaledSwitchLinear and NVFP4SwitchLinear: Muse Spark experts that carry an
-# NVFP4 tensor scale.
-_OQE_SWITCH_LINEAR_CLASSES = {
-    "SwitchLinear",
-    "QuantizedSwitchLinear",
-    "ScaledSwitchLinear",
-    "NVFP4SwitchLinear",
-}
+_OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear"}
 
 
 def _is_oqe_switch_module(module) -> bool:
@@ -7831,6 +7829,9 @@ def _find_model_layers(model):
     embed_fn = None
     layers = None
 
+    if getattr(model, "model_type", None) == "muse_spark":
+        # mlx-lm's Muse Spark normalizes its token embeddings.
+        return model.model.language_model.embed, model.layers
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         embed_fn = model.model.embed_tokens
         layers = model.model.layers
@@ -8233,6 +8234,13 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
             )
             return None, None
 
+    if muse_spark_layout is not None and isinstance(
+        block, muse_spark_layout.muse_spark.TransformerBlock
+    ):
+        # mlx-lm's Muse Spark block takes the mask and cache by keyword only.
+        result = block(inputs, mask=mask, cache=None)
+        return (result[0] if isinstance(result, tuple) else result), None
+
     last_exc = None
     for call_args in [
         (inputs, mask, None, position_ids),
@@ -8332,8 +8340,12 @@ def _qdq_weight_only(weight, bits: int, group_size: int, mode: str):
     )
 
 
-def _temporary_quantize_block(block, config, oq_level, group_size: int):
+def _temporary_quantize_block(
+    block, config, oq_level, group_size: int, layer_idx: int | None = None
+):
     """Quantize-dequantize a block using the active predicate configuration."""
+    # Muse Spark NVFP4 experts this level passes through are written unchanged.
+    passthrough = _muse_spark_passthrough_capture_skip(config, oq_level, group_size)
     saved = {}
     for path, module in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
         if not hasattr(module, "weight") or not hasattr(module, "to_quantized"):
@@ -8341,6 +8353,12 @@ def _temporary_quantize_block(block, config, oq_level, group_size: int):
         if getattr(module.weight, "ndim", 0) < 2:
             continue
         norm_path = _normalize_quant_path(path)
+        if _is_muse_spark(config):
+            # The fused qkvg_proj takes the one format oQ gives its parts.
+            norm_path = muse_spark_layout.oq_names(norm_path)[0]
+            layer_path = f"{muse_spark_layout.LAYER_PREFIX}{layer_idx}.{norm_path}"
+            if layer_path in passthrough:
+                continue
         bits, gs, mode = _get_predicate_bits(norm_path, config, oq_level, group_size)
         if bits is None or module.weight.shape[-1] % gs != 0:
             continue
@@ -8467,8 +8485,8 @@ class _ImatrixCaptureWrapper(nn.Module):
                 raise exc
             return getattr(module, key)
 
-    # Parents may read parameters by key (Muse Spark checks
-    # ``"global_scale" in proj``), so key lookups reach the wrapped module.
+    # Parents may read parameters by key (``"global_scale" in proj``), so key
+    # lookups reach the wrapped module.
     def __contains__(self, key) -> bool:
         return key in object.__getattribute__(self, "_module")
 
@@ -8877,6 +8895,25 @@ def _collect_mtp_head_imatrix(
         return False
 
 
+def _load_muse_spark_calibration_model(model_path):
+    """The text model of a Muse Spark checkpoint as oMLX serves it."""
+    path = Path(model_path)
+    kwargs = muse_spark_serving.load_kwargs(path, text_only=True)
+    model, _ = load_model(path, lazy=True, strict=False, **kwargs)
+    return model, load_mlx_lm_tokenizer(path)
+
+
+def _oq_imatrix_entries(entries: dict, config: dict) -> dict:
+    """Name calibration statistics after oQ's tensors."""
+    if not _is_muse_spark(config):
+        return entries
+    return {
+        oq_name: entry
+        for name, entry in entries.items()
+        for oq_name in muse_spark_layout.oq_names(name)
+    }
+
+
 def _collect_imatrix_from_model(
     model,
     tokenizer,
@@ -9198,7 +9235,7 @@ def _collect_imatrix_from_model(
                 f"{successful_layer_forwards} layer forwards completed, "
                 "but no hook captured a compatible activation"
             )
-    return collector.entries, metadata
+    return _oq_imatrix_entries(collector.entries, config), metadata
 
 
 # --- Streamed per-layer weight sourcing (layer-streaming imatrix collector) ---
@@ -9247,16 +9284,10 @@ def _streamed_text_args(model_path, config, *, trust_remote_code: bool = False):
         from mlx_vlm.models.glm5_next.language import Glm5NextDecoderLayer
 
         layer_cls = Glm5NextDecoderLayer
-    elif _stream_source_model_type(config) == "muse_spark":
-        # Bare blocks keep BF16 SwitchLinear experts: the NVFP4 pairs are
-        # sourced dequantized and the block applies their tensor scales. The
-        # full config carries the ModelOpt layout the block needs for that.
-        from omlx.patches.muse_spark.muse_spark_model import (
-            ModelArgs,
-            streamed_decoder_layer,
-        )
-
-        return ModelArgs.from_dict(config), streamed_decoder_layer
+    elif _is_muse_spark(config):
+        # mlx-lm's decoder block; calibration_items maps oQ's tensors to it.
+        args = muse_spark_layout.calibration_args(config)
+        return args, muse_spark_layout.calibration_block
     else:
         from mlx_vlm.models.minimax_m3_vl.config import TextConfig
         from mlx_vlm.models.minimax_m3_vl.language import MiniMaxDecoderLayer
@@ -9379,6 +9410,8 @@ def _iter_streamed_layer_blocks(
     )
     for layer_idx in range(args.num_hidden_layers):
         items = _streamed_layer_items(dp, layer_idx, skip_key=skip_key)
+        if _is_muse_spark(config):
+            items = muse_spark_layout.calibration_items(items, layer_idx, config)
         block = layer_cls(args, layer_idx)
         # Freshly constructed modules default to training mode; loaded models
         # run in eval mode. Layer implementations may branch on the flag
@@ -9694,7 +9727,9 @@ def _streamed_sensitivity_layer(
             f"streamed sensitivity: layer {layer_idx} float forward returned "
             f"no output for {type(block).__name__}"
         )
-    saved = _temporary_quantize_block(block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE)
+    saved = _temporary_quantize_block(
+        block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE, layer_idx=layer_idx
+    )
     try:
         out_quant, _ = _forward_layer_result(
             block, state["inputs"], layer_mask, state["position_ids"], layer_idx=layer_idx
@@ -10233,7 +10268,7 @@ def _collect_imatrix_streaming(
         scores = sens_state["scores"] if sens_state is not None else {}
         _log_streamed_sensitivity(sensitivity_oq_level, scores)
         metadata["sensitivity_map"] = scores
-    return collector.entries, metadata
+    return _oq_imatrix_entries(collector.entries, config), metadata
 
 
 def _collect_imatrix(
@@ -10307,7 +10342,9 @@ def _collect_imatrix(
             logger.debug("MTP runtime patch skipped for oQe imatrix: %s", e)
 
     try:
-        if is_vlm:
+        if _is_muse_spark(config):
+            model, tokenizer = _load_muse_spark_calibration_model(model_path)
+        elif is_vlm:
             from mlx_vlm.utils import load_model as vlm_load_model
 
             # Calibration proxies deliberately retain SSD-mapped tensors that
@@ -10611,7 +10648,7 @@ def _measure_sensitivity_from_model(
             continue
 
         saved = _temporary_quantize_block(
-            block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE
+            block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE, layer_idx=layer_idx
         )
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = prev_aux
@@ -10710,7 +10747,9 @@ def _measure_sensitivity(
             logger.debug(f"mlx-vlm MTP runtime patch skipped for sensitivity: {e}")
 
     try:
-        if is_vlm:
+        if _is_muse_spark(config):
+            model, tokenizer = _load_muse_spark_calibration_model(model_path)
+        elif is_vlm:
             from mlx_vlm.utils import load_model as vlm_load_model
 
             # Sensitivity uses the same proxy representation as imatrix
@@ -11165,7 +11204,9 @@ def _measure_sensitivity_from_quantized_model(
 
     restore_mtp_active = None
     try:
-        if is_vlm:
+        if _is_muse_spark(config):
+            model, tokenizer = _load_muse_spark_calibration_model(model_path)
+        elif is_vlm:
             if has_mtp_heads and has_mtp_weights:
                 try:
                     from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
