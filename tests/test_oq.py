@@ -56,6 +56,7 @@ from omlx.oq import (
     _is_audio_tensor,
     _is_moe_router,
     _LazyTensorIndex,
+    _mandatory_head_bits,
     _load_builtin_calibration,
     _measure_sensitivity,
     _measure_sensitivity_from_model,
@@ -1600,7 +1601,7 @@ class TestLevelBudgetPlan:
         assert plan.effective_bpw <= cap
 
     def test_build_quant_plan_mandatory_lm_head(self):
-        # lm_head gets mandatory 8-bit boost (consensus-critical)
+        # lm_head is boosted before anything else, three bits over a 4-bit base
         named_shapes = {"lm_head": (4096, 32000)}
         for i in range(32):
             named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (4096, 4096)
@@ -1613,7 +1614,74 @@ class TestLevelBudgetPlan:
             named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7
         )
         assert "lm_head" in plan.boost_map
-        assert plan.boost_map["lm_head"]["bits"] == 8
+        assert plan.boost_map["lm_head"]["bits"] == 6
+
+    def test_mandatory_head_bits_track_the_base_width(self):
+        head = [
+            _mandatory_head_bits("lm_head", 1, 100, b, False, False)
+            for b in (2, 3, 4, 5, 6)
+        ]
+        assert head == [5, 6, 6, 8, 8]  # 7-bit is not a valid width
+        # A tied embedding is also the head, but too large for three bits.
+        assert _mandatory_head_bits("embed_tokens", 30, 100, 4, True, False) == 5
+        assert _mandatory_head_bits("embed_tokens", 1, 100, 6, True, True) == 6
+        # Large untied embeddings of dense models get one bit over the base.
+        assert _mandatory_head_bits("embed_tokens", 30, 100, 2, False, False) == 3
+        assert _mandatory_head_bits("embed_tokens", 30, 100, 6, False, False) == 6
+        # Small embeddings, and MoE embeddings, stay at 8-bit.
+        assert _mandatory_head_bits("embed_tokens", 1, 100, 4, False, False) == 8
+        assert _mandatory_head_bits("embed_tokens", 30, 100, 4, False, True) == 8
+
+    @staticmethod
+    def _dense_shapes():
+        shapes = {"lm_head": (2048, 4096)}
+        for i in range(8):
+            shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            shapes[f"model.layers.{i}.mlp.gate_proj"] = (14336, 4096)
+            shapes[f"model.layers.{i}.mlp.up_proj"] = (14336, 4096)
+            shapes[f"model.layers.{i}.mlp.down_proj"] = (4096, 14336)
+        return shapes
+
+    def test_dense_floor_lifts_two_bit_tensors_first(self):
+        shapes = self._dense_shapes()
+        config = {"num_hidden_layers": 8, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            shapes, config, 2.5, target_bpw=3.1, hard_cap_bpw=3.3
+        )
+        assert plan.effective_bpw <= 3.3
+        layers = [p for p in shapes if p != "lm_head"]
+        assert min(plan.boost_map.get(p, {"bits": 2})["bits"] for p in layers) >= 3
+
+    def test_dense_floor_skips_models_with_passthrough_experts(self):
+        # Experts kept in source precision never reach the budget, but the
+        # config still marks the model as MoE.
+        config = {"num_hidden_layers": 8, "_oq_use_budget_plan": True}
+        config["num_local_experts"] = 8
+        plan = _build_quant_plan(
+            self._dense_shapes(), config, 2.5, target_bpw=3.1, hard_cap_bpw=3.3
+        )
+        assert all(b.get("group_size") != 128 for b in plan.boost_map.values())
+
+    def test_moe_always_on_tensors_climb_together(self):
+        shapes = {"lm_head": (2000, 2048)}
+        for i in range(8):
+            shapes[f"model.layers.{i}.self_attn.q_proj"] = (2048, 2048)
+            shapes[f"model.layers.{i}.self_attn.o_proj"] = (2048, 2048)
+            shapes[f"model.layers.{i}.mlp.switch_mlp.down_proj"] = (64, 2048, 1024)
+        config = {
+            "num_hidden_layers": 8,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {str(i): float(8 - i) for i in range(8)},
+        }
+        plan = _build_quant_plan(
+            shapes, config, 3, target_bpw=3.5, hard_cap_bpw=3.7
+        )
+        assert plan.effective_bpw <= 3.7
+        attention = [p for p in shapes if "self_attn" in p]
+        # Spread over every attention tensor, not 8-bit next to base 3-bit.
+        assert min(plan.boost_map.get(p, {"bits": 3})["bits"] for p in attention) > 3
+        experts = [p for p in shapes if "switch_mlp" in p]
+        assert all(p not in plan.boost_map for p in experts)
 
     def test_build_quant_plan_sensitivity_driven(self):
         # Sensitive layers get more bits, insensitive get fewer

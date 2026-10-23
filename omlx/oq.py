@@ -1047,12 +1047,55 @@ def _routed_expert_projection(path: str) -> str | None:
     return None
 
 
-_MANDATORY_BOOST_PATTERNS = {
-    "lm_head": {"bits": 8, "group_size": 64, "mode": "affine"},
-    "embeddings": {"bits": 8, "group_size": 64, "mode": "affine"},
-    "embed_tokens": {"bits": 8, "group_size": 64, "mode": "affine"},
-    "wte": {"bits": 8, "group_size": 64, "mode": "affine"},
-}
+# Output head and token embeddings, sized by _mandatory_head_bits before any
+# other boost.
+_MANDATORY_BOOST_PATTERNS = ("lm_head", "embeddings", "embed_tokens", "wte")
+
+# Dense models below 3-bit lift every decoder tensor to this floor first;
+# wider groups keep it inside the low-level budgets.
+_DENSE_FLOOR_BITS = 3
+_DENSE_FLOOR_GROUP_SIZE = 128
+# MoE always-on tensors climb these widths one step per round.
+_ALWAYS_ON_LADDER = (3, 4, 5, 6, 8)
+
+# Token embeddings above this share of the budgeted parameters cost enough at
+# 8-bit to starve the layers that every token runs through.
+_LARGE_EMBEDDING_SHARE = 0.03
+
+
+def _is_always_on_tensor(path: str) -> bool:
+    """Decoder weights every token runs through: all but routed experts and heads."""
+    if _is_routed_expert(path) or _is_vision_tensor(path) or _is_audio_tensor(path):
+        return False
+    return not any(p in path for p in _MANDATORY_BOOST_PATTERNS)
+
+
+def _mandatory_head_bits(
+    pattern: str,
+    numel: int,
+    total_params: int,
+    base_bits: int,
+    tied: bool,
+    is_moe: bool,
+) -> int:
+    """Bits for the output head and token embeddings at a given base width.
+
+    The output head is a full matmul on every token, so it stays a few bits
+    above the base. Embeddings are row lookups: small tables stay at 8-bit,
+    large ones get one bit above the base. A tied embedding is both, and at
+    vocabulary size three extra bits starve the layers every token runs
+    through, so it gets one. MoE budgets can leave the experts out, so the
+    share test only applies to dense models.
+    """
+    if pattern == "lm_head":
+        bits = base_bits + 3
+    elif tied or (
+        not is_moe and numel / max(total_params, 1) >= _LARGE_EMBEDDING_SHARE
+    ):
+        bits = base_bits + 1
+    else:
+        bits = 8
+    return max(b for b in _VALID_QUANT_BITS if b <= min(bits, 8))
 
 
 def _sensitivity_tier(layer_score: float, max_score: float) -> int:
@@ -1176,15 +1219,24 @@ def _build_quant_plan(
     hard_cap_bpw: float = 4.7,
     fixed_overrides: dict[str, dict] | None = None,
     supported_bits: tuple[int, ...] = _VALID_QUANT_BITS,
+    always_on_rules: bool = True,
 ) -> QuantPlan:
     """Allocate byte-budgeted boosts using sensitivity-driven allocation.
 
     Strategy:
-    1. Mandatory pre-allocation: consensus-critical tensors (lm_head → 8-bit)
-    2. Data-driven: all non-expert tensors compete equally, ranked by
-       layer sensitivity score. Higher sensitivity → more bits.
-    3. Routed experts stay at base bits except explicit fractional floors and
+    1. Mandatory pre-allocation: output head and token embeddings, sized by
+       _mandatory_head_bits.
+    2. Dense models below 3-bit: every decoder tensor is lifted to 3-bit with
+       group 128 first, most sensitive layers first.
+    3. MoE models: after the protection floor, the tensors every token runs
+       through climb one width per round, most sensitive first.
+    4. Data-driven: remaining non-expert tensors compete by layer sensitivity.
+    5. Budget still left returns the output head and embeddings to 8-bit.
+    6. Routed experts stay at base bits except explicit fractional floors and
        the oQ2.5/oQ2.7 fallback routed-layer boost.
+
+    always_on_rules=False skips steps 2 and 3 for callers with their own
+    allocation or exporter constraints.
 
     fixed_overrides marks tensors whose output format is fixed up front
     (pre-quantized source tensors passed through as mxfp4/mxfp8). They are
@@ -1231,6 +1283,12 @@ def _build_quant_plan(
     )
     total_bits_f = current_bpw * total_params
 
+    # Experts passed through in source precision never reach the budget.
+    is_moe = expert_params > 0 or _config_expects_moe_expert_counts(config)
+    # Without an output head tensor the embedding doubles as the head.
+    tied_embeddings = not any(
+        "lm_head" in path or path == "output" for path in named_shapes
+    )
     module = None
     for path, shape in named_shapes.items():
         if path in fixed_overrides:
@@ -1240,13 +1298,18 @@ def _build_quant_plan(
         )
         if pred is False:
             continue
-        for pattern, boost in _MANDATORY_BOOST_PATTERNS.items():
+        for pattern in _MANDATORY_BOOST_PATTERNS:
             if pattern in path:
-                cand_bits = int(boost["bits"])
+                numel = 1
+                for dim in shape:
+                    numel *= dim
+                cand_bits = _mandatory_head_bits(
+                    pattern, numel, total_params, base_bits, tied_embeddings, is_moe
+                )
                 if cand_bits <= base_bits:
                     break
-                cand_gs = int(boost.get("group_size", base_group_size))
-                cand_mode = boost.get("mode", _mode_for_bits(cand_bits))
+                cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+                cand_mode = _mode_for_bits(cand_bits)
                 base_cost = _tensor_quantized_bytes(
                     shape, base_bits, base_group_size, base_mode
                 )
@@ -1256,7 +1319,11 @@ def _build_quant_plan(
                 delta = 8 * (cand_cost - base_cost)
                 next_bpw = (total_bits_f + delta) / total_params
                 if delta > 0 and next_bpw <= hard_cap_bpw:
-                    boost_map[path] = dict(boost)
+                    boost_map[path] = {
+                        "bits": cand_bits,
+                        "group_size": cand_gs,
+                        "mode": cand_mode,
+                    }
                     total_bits_f += delta
                     current_bpw = next_bpw
                 break
@@ -1290,6 +1357,42 @@ def _build_quant_plan(
                 }
                 total_bits_f += delta
                 current_bpw = total_bits_f / total_params
+
+    # Dense models: affine 2-bit loses too much on tensors every token runs
+    # through, so lift them to 3-bit with wider groups before any boost.
+    # Most sensitive layers go first in case the cap stops the pass early.
+    if always_on_rules and not is_moe and base_bits < 3:
+        dense_floor = []
+        for path, shape in named_shapes.items():
+            if path in boost_map or path in fixed_overrides:
+                continue
+            if not _is_always_on_tensor(path):
+                continue
+            pred = universal_quant_predicate(
+                path, module, {**config, "_oq_boost_map": {}}, oq_level
+            )
+            if pred is False:
+                continue
+            score = float(layer_scores.get(str(_extract_layer_index(path)), 0.0))
+            dense_floor.append((score, path, shape))
+        for _score, path, shape in sorted(dense_floor, key=lambda x: -x[0]):
+            old_cost = _tensor_quantized_bytes(
+                shape, base_bits, base_group_size, base_mode
+            )
+            new_cost = _tensor_quantized_bytes(
+                shape, _DENSE_FLOOR_BITS, _DENSE_FLOOR_GROUP_SIZE, "affine"
+            )
+            delta = 8 * (new_cost - old_cost)
+            next_bpw = (total_bits_f + delta) / total_params
+            if delta <= 0 or next_bpw > hard_cap_bpw:
+                continue
+            boost_map[path] = {
+                "bits": _DENSE_FLOOR_BITS,
+                "group_size": _DENSE_FLOOR_GROUP_SIZE,
+                "mode": "affine",
+            }
+            total_bits_f += delta
+            current_bpw = next_bpw
 
     # Protection floor: apply full protection rules as minimum bits for
     # non-expert tensors. This ensures attention, shared experts, etc. get
@@ -1329,6 +1432,60 @@ def _build_quant_plan(
         total_bits_f += delta
         current_bpw = next_bpw
 
+    # MoE models: attention, shared experts and dense MLPs run on every token
+    # while each routed expert sees a small share of them. After the
+    # protection floor, raise them one step per round, most sensitive first:
+    # spreading the budget beats a few 8-bit tensors next to low-bit ones.
+    if always_on_rules and expert_params > 0:
+        always_on = []
+        for path, shape in named_shapes.items():
+            if path in fixed_overrides or not _is_always_on_tensor(path):
+                continue
+            pred = universal_quant_predicate(
+                path, module, {**config, "_oq_boost_map": {}}, oq_level
+            )
+            if pred is False:
+                continue
+            score = float(layer_scores.get(str(_extract_layer_index(path)), 0.0))
+            always_on.append((score, path, shape))
+        always_on.sort(key=lambda x: -x[0])
+        raised = True
+        while raised:
+            raised = False
+            for _score, path, shape in always_on:
+                cur = boost_map.get(path) or {
+                    "bits": base_bits,
+                    "group_size": base_group_size,
+                    "mode": base_mode,
+                }
+                steps = [
+                    b
+                    for b in _ALWAYS_ON_LADDER
+                    if b > cur["bits"] and b in supported_bits
+                ]
+                if not steps:
+                    continue
+                bits = steps[0]
+                delta = 8 * (
+                    _tensor_quantized_bytes(
+                        shape, bits, _OQ_DEFAULT_GROUP_SIZE, "affine"
+                    )
+                    - _tensor_quantized_bytes(
+                        shape, cur["bits"], cur["group_size"], cur["mode"]
+                    )
+                )
+                next_bpw = (total_bits_f + delta) / total_params
+                if delta <= 0 or next_bpw > hard_cap_bpw:
+                    continue
+                boost_map[path] = {
+                    "bits": bits,
+                    "group_size": _OQ_DEFAULT_GROUP_SIZE,
+                    "mode": "affine",
+                }
+                total_bits_f += delta
+                current_bpw = next_bpw
+                raised = True
+
     # Sensitivity-based greedy boost: boost tensors from their current bits
     # (which may already be elevated by the protection floor) using remaining
     # budget up to hard_cap_bpw.
@@ -1355,7 +1512,11 @@ def _build_quant_plan(
             layer_score = float(layer_scores.get(str(layer_idx), 0.0))
         # Current bits (floor or base)
         cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
-        cur_gs = _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
+        cur_gs = (
+            int(boost_map[path].get("group_size", _OQ_DEFAULT_GROUP_SIZE))
+            if path in boost_map
+            else _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
+        )
         cur_mode = _mode_for_bits(cur_bits)
         cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
         # Max target based on sensitivity
@@ -1402,13 +1563,15 @@ def _build_quant_plan(
         for path, shape in named_shapes.items():
             if _is_routed_expert(path) or path in fixed_overrides:
                 continue
+            if any(p in path for p in _MANDATORY_BOOST_PATTERNS):
+                continue
             cur = boost_map.get(path)
             if cur is None:
                 continue
             cur_bits = cur["bits"]
             if cur_bits >= 8:
                 continue
-            cur_gs = _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
+            cur_gs = int(cur.get("group_size", _OQ_DEFAULT_GROUP_SIZE))
             cur_mode = _mode_for_bits(cur_bits)
             cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
             layer_idx = _extract_layer_index(path)
@@ -1444,6 +1607,28 @@ def _build_quant_plan(
                 break
             if current_bpw >= target_bpw:
                 break
+
+    # The head and embeddings were sized down so the layers could claim the
+    # budget first. Budget the layers left unused takes them back to 8-bit
+    # before it reaches routed experts.
+    for path in sorted(boost_map, key=lambda p: "lm_head" not in p):
+        cur = boost_map[path]
+        if cur["bits"] >= 8 or not any(p in path for p in _MANDATORY_BOOST_PATTERNS):
+            continue
+        shape = named_shapes[path]
+        full_gs = _gs_for_mode(8, _OQ_DEFAULT_GROUP_SIZE)
+        delta = 8 * (
+            _tensor_quantized_bytes(shape, 8, full_gs, _mode_for_bits(8))
+            - _tensor_quantized_bytes(
+                shape, cur["bits"], cur["group_size"], cur["mode"]
+            )
+        )
+        next_bpw = (total_bits_f + delta) / total_params
+        if next_bpw > hard_cap_bpw:
+            continue
+        boost_map[path] = {"bits": 8, "group_size": full_gs, "mode": _mode_for_bits(8)}
+        total_bits_f += delta
+        current_bpw = next_bpw
 
     if current_bpw < target_bpw:
         total_bits_f, current_bpw = _apply_routed_layer_boosts(
