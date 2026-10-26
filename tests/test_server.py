@@ -24,6 +24,7 @@ from omlx.exceptions import (
     ModelUnavailableError,
 )
 from omlx.model_settings import ModelSettings, ModelSettingsManager
+from omlx.request import TokenLogprob
 from omlx.server import (
     EngineType,
     SamplingDefaults,
@@ -1651,6 +1652,83 @@ def prepared_chat_engine():
     engine.start = AsyncMock()
     engine.supports_request_scoped_abort = False
     return engine
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_completion_returns_token_logprobs(
+    monkeypatch, prepared_chat_engine, stream
+):
+    def entry(text):
+        alt = TokenLogprob(token_id=9, text="x", token_bytes=[120], logprob=-3.0)
+        return TokenLogprob(1, text, list(text.encode()), -0.5, top=[alt])
+
+    # The last token adds no text, so its logprob rides on the finish chunk.
+    chunks = [("Hel", [entry("Hel")]), ("lo", [entry("lo")]), ("", [entry("<e>")])]
+    engine = prepared_chat_engine
+    engine.preflight_chat = AsyncMock()
+    engine.chat = AsyncMock(
+        return_value=GenerationOutput(
+            text="Hello", logprobs=[e for _, lps in chunks for e in lps]
+        )
+    )
+    streamed_kwargs = []
+
+    async def stream_chat(**kwargs):
+        streamed_kwargs.append(kwargs)
+        for i, (text, lps) in enumerate(chunks):
+            done = i == len(chunks) - 1
+            yield GenerationOutput(
+                text=text, new_text=text, logprobs=lps, finished=done
+            )
+
+    engine.stream_chat = stream_chat
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = None
+    state = ServerState()
+    state.engine_pool = pool
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    monkeypatch.setattr(srv, "validate_context_window", MagicMock())
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    body = {
+        "model": "test-model",
+        "stream": stream,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "logprobs": True,
+        "top_logprobs": 1,
+    }
+
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200, response.text
+    generated = streamed_kwargs[0] if stream else engine.chat.call_args.kwargs
+    assert (generated["logprobs"], generated["top_logprobs"]) == (True, 1)
+    if stream:
+        choices = [
+            json.loads(line.removeprefix("data: "))["choices"][0]
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        content = [
+            lp for c in choices for lp in (c.get("logprobs") or {}).get("content", [])
+        ]
+        assert choices[-1]["finish_reason"] == "stop"
+        assert choices[-1]["logprobs"]["content"][0]["token"] == "<e>"
+    else:
+        content = response.json()["choices"][0]["logprobs"]["content"]
+    assert [lp["token"] for lp in content] == ["Hel", "lo", "<e>"]
+    assert content[0]["bytes"] == list(b"Hel")
+    assert content[0]["top_logprobs"] == [
+        {"token": "x", "logprob": -3.0, "bytes": [120]}
+    ]
 
 
 @pytest.mark.parametrize("subclass", [False, True])

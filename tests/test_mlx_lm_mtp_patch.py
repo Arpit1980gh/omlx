@@ -197,6 +197,14 @@ class TestMtpBoundaryCommit:
         assert len(batch.tokens[0]) == 4
         assert cache.offset == 4
 
+    def test_accepted_drafts_report_target_rows(self, monkeypatch):
+        _, state, _ = self._run_full_accept_cycle(monkeypatch, emitted=2, drafts=2)
+
+        drafts = [(token, lp) for token, lp, source in state.queue if source == "draft"]
+        assert drafts
+        # The draft rows are all zeros; each verify row peaks at its token.
+        assert all(int(mx.argmax(lp).item()) == token for token, lp in drafts)
+
     def test_boundary_emit_replaces_copied_drafts(self, monkeypatch):
         from omlx.patches.mlx_lm_mtp import batch_generator as bg
 

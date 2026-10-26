@@ -21,6 +21,7 @@ import math
 from typing import Callable, List, Optional, Sequence
 
 import mlx.core as mx
+import numpy as np
 
 
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
@@ -333,3 +334,30 @@ def make_shared_sampler(
         int(min_tokens_to_keep),
         int(top_k or 0),
     )
+
+
+def select_logprobs(
+    logprobs: mx.array, token_id: int, top_n: int
+) -> tuple[float, list[tuple[int, float]]]:
+    """Return the logprob of ``token_id`` and the ``top_n`` most likely tokens.
+
+    The row is read on the host: an MLX op here would wait behind the decode
+    step BatchGenerator has already queued. The row is in the model dtype, so
+    it is renormalized in float32.
+    """
+    if logprobs.dtype == mx.bfloat16:
+        raw = np.frombuffer(memoryview(logprobs), dtype=np.uint16)
+        values = (raw.astype(np.uint32) << 16).view(np.float32)
+    else:
+        values = np.asarray(memoryview(logprobs)).astype(np.float32)
+    peak = values.max()
+    values = values - (peak + np.log(np.exp(values - peak).sum()))
+    chosen = float(values[token_id])
+    top_n = min(top_n, values.size)
+    if top_n <= 0:
+        return chosen, []
+    top_ids = np.argpartition(-values, top_n - 1)[:top_n]
+    top_ids = top_ids[np.argsort(-values[top_ids], kind="stable")]
+    # Tokens masked by a logits processor are not alternatives.
+    top_ids = top_ids[np.isfinite(values[top_ids])]
+    return chosen, [(int(i), float(values[i])) for i in top_ids]

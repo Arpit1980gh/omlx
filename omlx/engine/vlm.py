@@ -1719,6 +1719,10 @@ class VLMBatchedEngine(BaseEngine):
         return self._tokenizer
 
     @property
+    def supports_logprobs(self) -> bool:
+        return not self.is_diffusion_model
+
+    @property
     def supports_early_tool_call_streaming(self) -> bool:
         """Opt in only when the local scheduler has no structured parser."""
 
@@ -4741,6 +4745,8 @@ class VLMBatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
             logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -4771,6 +4777,7 @@ class VLMBatchedEngine(BaseEngine):
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
+            logprobs=output.logprobs,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
         )
@@ -4862,6 +4869,8 @@ class VLMBatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
             logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: pass per-request overrides
@@ -4904,6 +4913,7 @@ class VLMBatchedEngine(BaseEngine):
                     finished=output.finished,
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
+                    logprobs=output.logprobs,
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),

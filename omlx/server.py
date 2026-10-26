@@ -127,6 +127,8 @@ from .api.openai_models import (
     ChatCompletionChunkDelta,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatCompletionTokenLogprob,
+    ChoiceLogprobs,
     ClaudeTierModelInfo,
     CompletionChoice,
     CompletionRequest,
@@ -140,6 +142,7 @@ from .api.openai_models import (
     TokenizeChatRequest,
     TokenizeRequest,
     TokenizeResponse,
+    TopLogprob,
     Usage,
 )
 from .api.parser_tool_calls import (
@@ -5056,6 +5059,10 @@ async def create_chat_completion(
             structured_outputs=structured_outputs,
             guided_grammar=guided_grammar,
         )
+        if request.logprobs and not engine.supports_logprobs:
+            raise InvalidRequestError(
+                "logprobs is not supported for this model.", field="logprobs"
+            )
         native_response_format = _native_response_format(
             engine, response_format, structured_outputs
         )
@@ -5169,6 +5176,10 @@ async def create_chat_completion(
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
             chat_kwargs["seed"] = request.seed
+
+        if request.logprobs:
+            chat_kwargs["logprobs"] = True
+            chat_kwargs["top_logprobs"] = request.top_logprobs or 0
 
         # Add thinking budget if applicable
         if thinking_budget is not None:
@@ -5405,6 +5416,11 @@ async def create_chat_completion(
                             ),
                             tool_calls=tool_calls,
                         ),
+                        logprobs=(
+                            _choice_logprobs(output.logprobs)
+                            if request.logprobs
+                            else None
+                        ),
                         finish_reason=finish_reason,
                     )
                 ],
@@ -5493,6 +5509,25 @@ def _normalize_structured_outputs(
     if guided_grammar:
         return {"grammar": guided_grammar}
     return None
+
+
+def _choice_logprobs(entries) -> ChoiceLogprobs:
+    return ChoiceLogprobs(
+        content=[
+            ChatCompletionTokenLogprob(
+                token=entry.text,
+                logprob=entry.logprob,
+                bytes=entry.token_bytes,
+                top_logprobs=[
+                    TopLogprob(
+                        token=alt.text, logprob=alt.logprob, bytes=alt.token_bytes
+                    )
+                    for alt in entry.top
+                ],
+            )
+            for entry in entries or []
+        ]
+    )
 
 
 def _reject_diffusion_structured_outputs(
@@ -6483,6 +6518,17 @@ async def stream_chat_completion(
         if first_visible_time is None:
             first_visible_time = time.perf_counter()
 
+    # Token logprobs ride on the next emitted delta; the finish chunk takes
+    # whatever is left.
+    pending_logprobs: list = []
+
+    def take_logprobs() -> Optional[ChoiceLogprobs]:
+        if not pending_logprobs:
+            return None
+        choice_logprobs = _choice_logprobs(pending_logprobs)
+        pending_logprobs.clear()
+        return choice_logprobs
+
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.
     response_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -6569,6 +6615,8 @@ async def stream_chat_completion(
                     # exact API-observation time. Never substitute end-of-turn.
                     first_token_time = time.perf_counter()
             last_output = output
+            if request.logprobs and output.logprobs:
+                pending_logprobs.extend(output.logprobs)
             if output.tool_calls:
                 # A structured producer is authoritative. Correct engines keep
                 # the explicit capability false; this guard also prevents a
@@ -6603,6 +6651,7 @@ async def stream_chat_completion(
                     )
                     if thinking_delta:
                         accumulated_reasoning += thinking_delta
+                        chunk.choices[0].logprobs = take_logprobs()
                         event = (
                             f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                         )
@@ -6652,6 +6701,7 @@ async def stream_chat_completion(
                                         delta=ChatCompletionChunkDelta(
                                             content=segment.text
                                         ),
+                                        logprobs=take_logprobs(),
                                         finish_reason=None,
                                     )
                                 ],
@@ -7009,6 +7059,7 @@ async def stream_chat_completion(
         choices=[
             ChatCompletionChunkChoice(
                 delta=ChatCompletionChunkDelta(),
+                logprobs=take_logprobs(),
                 finish_reason=finish_reason,
             )
         ],

@@ -388,6 +388,9 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Per-token log probabilities of the generated tokens
+    logprobs: Optional[bool] = None
+    top_logprobs: Optional[int] = Field(default=None, ge=0, le=20)
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -400,6 +403,12 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="after")
     def check_ngram_window(self) -> "ChatCompletionRequest":
         _check_ngram_window(self.no_repeat_ngram_size, self.ngram_window)
+        return self
+
+    @model_validator(mode="after")
+    def check_top_logprobs(self) -> "ChatCompletionRequest":
+        if self.top_logprobs and not self.logprobs:
+            raise ValueError("top_logprobs requires logprobs to be true")
         return self
 
     @model_validator(mode="after")
@@ -428,11 +437,32 @@ class AssistantMessage(BaseModel):
     tool_calls: Optional[List[ToolCall]] = None
 
 
+class TopLogprob(BaseModel):
+    """Log probability of one token."""
+
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+
+
+class ChatCompletionTokenLogprob(TopLogprob):
+    """Log probability of a generated token and its most likely alternatives."""
+
+    top_logprobs: List[TopLogprob] = Field(default_factory=list)
+
+
+class ChoiceLogprobs(BaseModel):
+    """Log probabilities of the tokens in a choice."""
+
+    content: Optional[List[ChatCompletionTokenLogprob]] = None
+
+
 class ChatCompletionChoice(BaseModel):
     """A single choice in chat completion response."""
 
     index: int = 0
     message: AssistantMessage
+    logprobs: Optional[ChoiceLogprobs] = None
     finish_reason: Optional[str] = "stop"
 
 
@@ -745,6 +775,7 @@ class ChatCompletionChunkChoice(BaseModel):
 
     index: int = 0
     delta: ChatCompletionChunkDelta
+    logprobs: Optional[ChoiceLogprobs] = None
     finish_reason: Optional[str] = None
 
 

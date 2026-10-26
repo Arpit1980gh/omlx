@@ -992,3 +992,19 @@ _USER_MESSAGES = [{"role": "user", "content": "hi"}]
 def test_output_token_caps_must_be_positive(model_cls, payload):
     with pytest.raises(ValidationError):
         model_cls.model_validate({"model": "m", **payload})
+
+
+def test_chat_request_top_logprobs_requires_logprobs():
+    messages = [{"role": "user", "content": "hi"}]
+    with pytest.raises(ValidationError, match="top_logprobs requires logprobs"):
+        ChatCompletionRequest(model="m", messages=messages, top_logprobs=3)
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest(
+            model="m", messages=messages, logprobs=True, top_logprobs=21
+        )
+    request = ChatCompletionRequest(
+        model="m", messages=messages, logprobs=True, top_logprobs=0
+    )
+    assert request.logprobs is True
+    request = ChatCompletionRequest(model="m", messages=messages, logprobs=None)
+    assert not request.logprobs

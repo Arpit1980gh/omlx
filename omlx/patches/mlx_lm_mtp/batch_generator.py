@@ -4604,10 +4604,8 @@ def _run_verify_cycle_chain(
         finish_t0 = time.perf_counter()
         # --- commit: queue emits + cache rollback ---
         for j in range(m):
-            # Block drafters carry no draft distribution; the target row is
-            # the distribution the accepted token was verified against.
-            draft_lp = state.draft_lps[j] if state.draft_lps else combined_lp[j]
-            state.queue.append((int(draft_ids[j]), draft_lp, "draft"))
+            # Report the target row each accepted draft was verified against.
+            state.queue.append((int(draft_ids[j]), combined_lp[j], "draft"))
         state.queue.append(
             (int(emit_last_id), emit_last_lp, "bonus" if m == k else "verify")
         )
@@ -4898,10 +4896,9 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
             prev_buf=prev_draft if procs is not None else None,
             stats=state.stats,
         )
-        # Queue the two emitted tokens. Per PR 990: the accepted draft uses
-        # the *MTP head's* original draft distribution as its logprobs; the
-        # bonus uses the verify forward's bonus distribution.
-        state.queue.append((draft_id, state.draft_lp, "draft"))
+        # Queue both tokens with the target rows they were verified against,
+        # the same row the reject path reports.
+        state.queue.append((draft_id, verify_lp_2d.squeeze(0), "draft"))
         state.queue.append((bonus_id, bonus_lp_2d.squeeze(0), "bonus"))
         state.next_main = _ensure_uint32(bonus_tok)
         state.draft_tok = new_draft
