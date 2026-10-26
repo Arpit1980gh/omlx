@@ -1387,6 +1387,8 @@
   "modal.model_settings.moe_expert_offload_fraction_label": "Resident experts",
   "modal.model_settings.moe_expert_offload_resident_range": "(5-95)",
   "modal.model_settings.moe_expert_offload_resident_range_error": "Enter a number from 5 to 95.",
+  "modal.model_settings.moe_expert_offload_fit": "메모리에 맞추기: {percent}% 상주(~{size})면 프롬프트용으로 약 {reserve}가 남습니다",
+  "modal.model_settings.moe_expert_offload_no_fit": "5%만 상주해도 이 Mac의 메모리 한도에서는 프롬프트용으로 {reserve}를 남길 수 없습니다.",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "모델에 내장된 MTP 헤드로 한 스텝에 여러 토큰을 초안으로 생성합니다.",
   "modal.model_settings.mtp_depth": "Adaptive max depth",

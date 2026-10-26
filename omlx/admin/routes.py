@@ -9,6 +9,7 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
@@ -2719,6 +2720,42 @@ async def load_model(
 
     logger.info(f"Manually loaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+
+
+@router.get("/api/models/{model_id}/moe-offload-fit")
+async def get_moe_offload_fit(
+    model_id: str,
+    mtp_enabled: bool | None = None,
+    qwen4_ple_ssd_offload: bool | None = None,
+    deepseek_v41_engram_ssd_offload: bool | None = None,
+    is_admin: bool = Depends(require_admin),
+):
+    """Largest expert-offload residency that leaves prompt room on this machine.
+
+    The query flags override saved settings that change the size estimate, so
+    unsaved edits in the dashboard are sized too.
+    """
+    entry = _require_model(model_id)
+    if not moe_offload_compatibility(entry.model_path)[0]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model does not support MoE expert offload: {model_id}",
+        )
+    settings_manager = _get_settings_manager()
+    saved = settings_manager.get_settings(model_id) if settings_manager else None
+    settings = copy.copy(saved) if saved is not None else ModelSettings()
+    for key, value in (
+        ("mtp_enabled", mtp_enabled),
+        ("qwen4_ple_ssd_offload", qwen4_ple_ssd_offload),
+        ("deepseek_v41_engram_ssd_offload", deepseek_v41_engram_ssd_offload),
+    ):
+        if value is not None:
+            setattr(settings, key, value)
+    pool = _get_engine_pool()
+    # Read the live ceiling here; the per-probe header scans run off the loop.
+    return await asyncio.to_thread(
+        pool.moe_offload_fit, entry, settings, pool._current_ceiling()
+    )
 
 
 @router.post("/api/models/{model_id}/import-mtplx")

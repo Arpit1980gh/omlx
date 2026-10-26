@@ -10,6 +10,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 from omlx.engine_pool import (
@@ -451,6 +452,91 @@ class TestEnginePoolErrors:
             with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
                 asyncio.run(pool.get_engine("model-a"))
             assert pool._entries["model-a"].engine is mock_engine
+
+    def test_moe_offload_fit_leaves_prompt_reserve(self, small_mock_model_dir):
+        """The residency hint is sized by admission arithmetic against the
+        prompt line (ceiling x headroom) less other loaded models and the
+        prompt reserve. Same fixture as above: size = 75 * capacity - 400
+        bytes, capacity floored at 8."""
+        experts = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for field, width in (("weight", 4), ("scales", 1)):
+                experts[f"model.layers.0.mlp.switch_glu.{proj}.{field}"] = mx.zeros(
+                    (32, 5, width), dtype=mx.uint8
+                )
+        mx.save_safetensors(
+            str(small_mock_model_dir / "model-a" / "model.safetensors"), experts
+        )
+        pool = _make_pool()
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.estimated_size = 2000
+        settings = ModelSettings()
+        assert pool.moe_offload_fit(entry, settings, 2000)["status"] == "unknown"
+
+        pool._process_memory_enforcer = SimpleNamespace(_prefill_headroom_safety=0.9)
+        # Line 1800. Budget 1100 = capacity 20 = 64%, since 65% rounds to
+        # capacity 21 (1175 bytes). Another loaded model's 75 bytes -> 60%.
+        for reserve, others, expected in (
+            (700, 0, {"status": "fit", "max_percent": 64, "bytes": 1100}),
+            (700, 75, {"status": "fit", "max_percent": 60, "bytes": 1025}),
+            (1700, 0, {"status": "no_fit", "max_percent": None, "bytes": 0}),
+            (-300, 0, {"status": "resident", "max_percent": None, "bytes": 0}),
+        ):
+            pool._current_model_memory = others
+            with patch("omlx.engine_pool._MOE_OFFLOAD_PROMPT_RESERVE", reserve):
+                fit = pool.moe_offload_fit(entry, settings, 2000)
+                # A loaded entry carries its offload-adjusted runtime size.
+                entry.engine = MagicMock()
+                entry.runtime_estimated_size = 500
+                pool._current_model_memory = others + 500
+                assert pool.moe_offload_fit(entry, settings, 2000) == fit
+                entry.engine = entry.runtime_estimated_size = None
+            assert fit == {**expected, "reserve_bytes": reserve}
+        assert settings.moe_expert_offload_enabled is False
+
+    def test_moe_offload_fit_prefers_resident_table(self, tmp_path):
+        """A Qwen4 PLE table the load forces to mmap shrinks larger percents.
+        The hint keeps the table where the settings put it when that fits,
+        and falls back to the forced mmap only when nothing else does."""
+        entry = EngineEntry(
+            model_id="qwen4",
+            model_path=str(tmp_path),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="qwen4_exp",
+            estimated_size=2700,
+        )
+        pool = _make_pool()
+        pool._process_memory_enforcer = SimpleNamespace(_prefill_headroom_safety=0.9)
+
+        def status(entry, p, *, ceiling=None, log_decision=True):
+            pct = round(p.moe_expert_offload_resident_fraction * 100)
+            if not p.moe_expert_offload_enabled:
+                pct = 100
+            resident, mmap = 1700 + 10 * pct, 200 + 10 * pct
+            forced = resident > 1800 >= mmap
+            return p.qwen4_ple_ssd_offload or forced, forced, (resident, mmap)
+
+        def size(entry, p, **_):
+            enabled, _, (resident, mmap) = status(entry, p)
+            return mmap if enabled else resident
+
+        # Line 1800; the table is forced above 10%.
+        with (
+            patch.object(pool, "_qwen4_ple_offload_status", status),
+            patch.object(pool, "_entry_runtime_resident_size", size),
+        ):
+            for reserve, requested, expected in (
+                (0, False, (10, 1800)),
+                (300, False, (95, 1150)),
+                (1700, False, (None, 0)),
+                (700, True, (90, 1100)),
+            ):
+                settings = ModelSettings(qwen4_ple_ssd_offload=requested)
+                with patch("omlx.engine_pool._MOE_OFFLOAD_PROMPT_RESERVE", reserve):
+                    fit = pool.moe_offload_fit(entry, settings, 2000)
+                assert (fit["max_percent"], fit["bytes"]) == expected
 
     def test_missing_model_path_removes_unloaded_entry(self, small_mock_model_dir):
         """A deleted model directory is removed and reported as not found."""

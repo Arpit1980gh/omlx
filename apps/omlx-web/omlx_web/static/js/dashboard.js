@@ -263,6 +263,8 @@
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            moeOffloadFit: null,
+            moeOffloadFitUrl: null,
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -2268,6 +2270,41 @@
                 this.onMoeExpertOffloadResidentPercent();
             },
 
+            loadMoeOffloadFit() {
+                // Sized from the unsaved edits that change the estimate; refetch only when they change.
+                const model = this.selectedModel;
+                if (model?.moe_expert_offload_supported !== true) return;
+                const payload = this.buildModelSettingsPayload(this.modelSettings);
+                const params = new URLSearchParams();
+                for (const key of ['mtp_enabled', 'qwen4_ple_ssd_offload', 'deepseek_v41_engram_ssd_offload']) {
+                    params.set(key, String(!!payload[key]));
+                }
+                const url = `/admin/api/models/${encodeURIComponent(model.id)}/moe-offload-fit?${params}`;
+                if (url === this.moeOffloadFitUrl) return;
+                this.moeOffloadFitUrl = url;
+                this.moeOffloadFit = null;
+                return fetch(url).then(async resp => {
+                    if (!resp.ok) return;
+                    const fit = await resp.json();
+                    if (this.moeOffloadFitUrl === url) this.moeOffloadFit = fit;
+                }).catch(() => { /* network error */ });
+            },
+
+            moeOffloadFitText() {
+                const fit = this.moeOffloadFit;
+                const key = fit?.status === 'fit' ? 'moe_expert_offload_fit' : 'moe_expert_offload_no_fit';
+                return window.t(`modal.model_settings.${key}`)
+                    .replace('{percent}', fit?.max_percent)
+                    .replace('{size}', this.formatByteCount(fit?.bytes))
+                    .replace('{reserve}', this.formatByteCount(fit?.reserve_bytes));
+            },
+
+            applyMoeOffloadFit() {
+                if (this.moeOffloadFit?.status !== 'fit') return;
+                this.modelSettings.moe_expert_offload_resident_percent = this.moeOffloadFit.max_percent;
+                this.onMoeExpertOffloadResidentPercent();
+            },
+
             onMoeExpertOffloadResidentPercent() {
                 // Defer clamping until blur so partial input remains editable.
                 this.modelSettings.moe_expert_offload_resident_touched = true;
@@ -2974,6 +3011,8 @@
                     || this.selectedModel?.id !== model.id
                     || JSON.stringify(this.modelSettings) !== baseline)) return;
                 this.selectedModel = model;
+                // A fresh open re-sizes; a focus refresh keeps the current hint.
+                if (!preservingEdits) this.moeOffloadFitUrl = null;
                 this.modelSettings = this.buildModelSettingsState(
                     model,
                     model.settings || {},
