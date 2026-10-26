@@ -254,8 +254,8 @@ final class AskAIController {
         case .plain(let text):
             guard !text.isEmpty || hasImages else { return nil }
             if let profile = conversation.profile {
-                return PendingSend(profile: profile, command: conversation.command,
-                                   text: text, startsConversation: false)
+                return PendingSend(profile: currentProfile(command: conversation.command, fallback: profile),
+                                   command: conversation.command, text: text, startsConversation: false)
             }
             let profile = store.prefs.defaultProfile
             guard !profile.model.isEmpty else {
@@ -266,6 +266,19 @@ final class AskAIController {
         }
     }
 
+    /// Latest settings for the conversation's preset, or the default profile
+    /// for a plain conversation, so a toggle such as Auto Copy changed
+    /// mid-conversation applies to the next follow-up.
+    private func currentProfile(command: String?, fallback: AskAIProfile) -> AskAIProfile {
+        let latest = if let command {
+            store.prefs.presets.first { $0.command == command }?.profile
+        } else {
+            store.prefs.defaultProfile
+        }
+        guard let latest, !latest.model.isEmpty else { return fallback }
+        return latest
+    }
+
     private func start(_ pending: PendingSend, images: [AskAIImage], submittedDraft: String) {
         guard let config = services?.config,
               let url = AppConfig.httpURL(host: config.host, port: config.port,
@@ -273,6 +286,8 @@ final class AskAIController {
         else { return }
         if pending.startsConversation {
             conversation.begin(profile: pending.profile, command: pending.command)
+        } else {
+            conversation.updateProfile(pending.profile)
         }
         // A reset during the image check leaves nothing to follow up on.
         // Keep the input so the user can send again.

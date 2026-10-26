@@ -44,6 +44,12 @@ final class AskAIConversation {
         self.command = command
     }
 
+    /// Applies settings changed during the conversation to the next turn.
+    func updateProfile(_ profile: AskAIProfile) {
+        guard self.profile != nil else { return }
+        self.profile = profile
+    }
+
     func reset() {
         cancelStream()
         turns = []
