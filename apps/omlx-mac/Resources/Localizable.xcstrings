@@ -34082,6 +34082,390 @@
           }
         }
       }
+    },
+    "settings.advanced.gpu_power_limit.label" : {
+      "comment" : "Row label for the per-model GPU power limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU Power Limit"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ограничение мощности GPU"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 功率限制"
+          }
+        }
+      }
+    },
+    "settings.advanced.gpu_power_limit.sub" : {
+      "comment" : "Sublabel for the per-model GPU power limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Caps GPU power for the whole Mac while this model generates, from 2 to 1000 W. It only helps below the usual draw. For example, an M5 Max uses about 25 W to generate an answer: 10 W saves about 40% energy per token and 5 W about half."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ограничивает мощность GPU для всего Mac, пока эта модель генерирует, от 2 до 1000 Вт. Помогает только ниже обычного потребления. Например, M5 Max тратит около 25 Вт на генерацию ответа: 10 Вт экономят около 40% энергии на токен, 5 Вт — около половины."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在此模型生成期间限制整台 Mac 的 GPU 功率，范围 2 到 1000 W。只有低于平时功耗时才有效。例如，M5 Max 生成回答时约使用 25 W：10 W 可让每 token 能耗降低约 40%，5 W 约降低一半。"
+          }
+        }
+      }
+    },
+    "settings.advanced.gpu_power_limit.range" : {
+      "comment" : "Error when the GPU power limit is outside the accepted range",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU power limit must be between 2 and 1000 W."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Лимит мощности GPU должен быть от 2 до 1000 Вт."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 功率限制必须在 2 到 1000 W 之间。"
+          }
+        }
+      }
+    },
+    "bench.gpu_power_limit_note" : {
+      "comment" : "Note under a benchmark model picker when the model has a GPU power limit; placeholder is the watt value",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This model's %lld W GPU power limit does not apply to benchmarks."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Лимит мощности GPU этой модели (%lld Вт) не действует в бенчмарках."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此模型的 GPU 功率限制（%lld W）不适用于基准测试。"
+          }
+        }
+      }
+    },
+    "settings.summary.gpu_power_limit" : {
+      "comment" : "GPU power limit in the Advanced row value; placeholder is the watt value",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %@ W"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %@ Вт"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %@ W"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.unsupported" : {
+      "comment" : "Shown instead of the GPU power limit description when the GPU rejects a power cap",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This Mac's GPU does not support a power limit."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU этого Mac не поддерживает ограничение мощности."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 Mac 的 GPU 不支持功率限制。"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.title" : {
+      "comment" : "Title of the GPU power limit guide popover",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Measured on M5 Max (other chips differ)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Замеры на M5 Max (на других чипах иначе)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "M5 Max 实测（其他芯片不同）"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.limit" : {
+      "comment" : "GPU power guide column: the power limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Limit"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Лимит"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上限"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.answer" : {
+      "comment" : "GPU power guide column: change in token generation speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Answer speed"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скорость ответа"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "回答速度"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.energy" : {
+      "comment" : "GPU power guide column: change in energy used per generated token",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Energy per token"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Энергия на токен"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每 token 能耗"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.prompt" : {
+      "comment" : "GPU power guide column: change in prompt processing speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt speed"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скорость промпта"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "提示处理速度"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.none" : {
+      "comment" : "GPU power guide row for running without a power limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No limit"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Без лимита"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无限制"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.note" : {
+      "comment" : "Footnote of the GPU power limit guide popover",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 W or more barely changes answer speed. Below 5 W, energy per token stops falling and answers only get slower. The minimum is 2 W. Other requests and apps also slow down while the limit is active. Benchmarks run without it."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "От 30 Вт скорость ответа почти не меняется. Ниже 5 Вт энергия на токен больше не снижается, ответы только замедляются. Минимум — 2 Вт. Пока лимит действует, другие запросы и приложения тоже замедляются. Бенчмарки запускаются без него."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 W 及以上几乎不影响回答速度。低于 5 W 时每 token 能耗不再下降，只会让回答变慢。最小值为 2 W。限制生效期间，其他请求和应用也会变慢。基准测试不受此限制。"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.button" : {
+      "comment" : "Tooltip on the info button that opens the GPU power limit guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How much does a limit save?"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сколько экономит лимит?"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "限制能节省多少？"
+          }
+        }
+      }
+    },
+    "profile.detail.behavior.gpu_power_limit.on" : {
+      "comment" : "Behavior chip when a GPU power limit is set; placeholder is the watt value",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %lld W"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %lld Вт"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %lld W"
+          }
+        }
+      }
+    },
+    "profile.detail.behavior.gpu_power_limit.off" : {
+      "comment" : "Behavior chip label when the GPU power limit is off",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU power limit"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Лимит мощности GPU"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 功率限制"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

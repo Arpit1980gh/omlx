@@ -85,6 +85,7 @@ from ..settings import (
     SubKeyEntry,
     burst_decode_env,
 )
+from ..utils import gpu_power
 from ..utils.fatal import is_command_buffer_error
 from ..utils.hardware import (
     compute_owner_hash,
@@ -378,6 +379,7 @@ class ModelSettingsRequest(BaseModel):
     deepseek_v41_ced_prefill_enabled: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
+    gpu_power_limit_w: int | None = None
     mtp_adaptive_max_depth: int | None = None
     # Fixed Lightning MTP draft depth (None = adaptive).
     mtp_fixed_depth: int | None = None
@@ -451,6 +453,19 @@ class ModelSettingsRequest(BaseModel):
             return 4 if value == 0 else None
         if value not in (2, 2.5, 3, 3.5, 4, 6, 8):
             raise ValueError("turboquant_kv_bits must be 2, 2.5, 3, 3.5, 4, 6, or 8")
+        return value
+
+    @field_validator("gpu_power_limit_w")
+    @classmethod
+    def validate_gpu_power_limit(cls, value: int | None) -> int | None:
+        # Profiles and templates reuse this model, so the range applies to them too.
+        if value is None or value <= 0:
+            return None
+        if not gpu_power.MIN_WATTS <= value <= gpu_power.MAX_WATTS:
+            raise ValueError(
+                f"gpu_power_limit_w must be between {gpu_power.MIN_WATTS} and "
+                f"{gpu_power.MAX_WATTS} W, or 0 to turn it off"
+            )
         return value
 
     @field_validator("dflash_verify_mode")
@@ -2321,6 +2336,7 @@ def _model_options(model_info: dict, settings) -> dict:
         "qwen35_oq_a8_supported": (
             _oq_a8_model_supported(model_type) and _oq_a8_kernels_available()
         ),
+        "gpu_power_limit_supported": gpu_power.gpu_power_cap_supported(),
     }
 
 
@@ -2947,6 +2963,8 @@ async def update_model_settings(
             if request.thinking_budget_tokens and request.thinking_budget_tokens > 0
             else None
         )
+    if "gpu_power_limit_w" in sent:
+        current_settings.gpu_power_limit_w = request.gpu_power_limit_w
     for name in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
         if name not in sent:
             continue
@@ -8565,6 +8583,15 @@ async def get_ms_model_info(
 # =============================================================================
 
 
+def _drop_idle_gpu_power_cap() -> None:
+    # Benchmarks never take a GPU power cap. One still held for the release
+    # delay after a capped request would throttle the start of the run.
+    state = _get_server_state() if _get_server_state is not None else None
+    limiter = getattr(state, "gpu_power_limiter", None)
+    if limiter is not None:
+        limiter.drop_idle_cap()
+
+
 @router.post("/api/bench/accuracy/queue/add")
 async def add_to_accuracy_queue(
     request: Request,
@@ -8635,6 +8662,7 @@ async def add_to_accuracy_queue(
     )
 
     # Start processing if not already running (synchronous — sets bench_id immediately)
+    _drop_idle_gpu_power_cap()
     start_next_from_queue(engine_pool)
 
     return get_queue_status()
@@ -8834,6 +8862,7 @@ async def start_ane_tuning(
     tuning_request.backend = "k2" if entry.config_model_type == "k2_horizon" else "qwen"
     cleanup_old_runs()
     run = create_run(tuning_request)
+    _drop_idle_gpu_power_cap()
     run.task = asyncio.create_task(run_tuning(run, engine_pool))
     return {"tuning_id": run.tuning_id, "status": "started", "total": run.total}
 
@@ -9002,6 +9031,7 @@ async def start_context_benchmark(
 
     cleanup_old_runs()
     run = create_run(bench_request)
+    _drop_idle_gpu_power_cap()
     run.task = asyncio.create_task(run_context_benchmark(run, engine_pool))
 
     logger.info(
@@ -9249,6 +9279,7 @@ async def start_benchmark(
     run = create_run(bench_request)
     total_tests = len(bench_request.prompt_lengths) + len(bench_request.batch_sizes) * 2
 
+    _drop_idle_gpu_power_cap()
     run.task = asyncio.create_task(run_benchmark(run, engine_pool))
 
     logger.info(

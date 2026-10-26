@@ -1724,6 +1724,12 @@
                         }
                         continue;
                     }
+                    if (k === 'gpu_power_limit_w') {
+                        if (ms.enableGpuPowerLimit && ms.gpu_power_limit_w) {
+                            out.gpu_power_limit_w = Number(ms.gpu_power_limit_w);
+                        }
+                        continue;
+                    }
                     if (k === 'guided_grammar_enabled') {
                         out.guided_grammar_enabled = !!ms.guided_grammar_enabled;
                         continue;
@@ -2161,6 +2167,9 @@
                         model?.deepseek_v41_engram_ssd_offload_forced === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
+                    enableGpuPowerLimit: !!(s.gpu_power_limit_w),
+                    gpu_power_limit_w: s.gpu_power_limit_w || null,
+                    gpu_power_limit_supported: model?.gpu_power_limit_supported === true,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
                     guided_grammar: s.guided_grammar || '',
                     enableToolResultLimit: !!(s.max_tool_result_tokens),
@@ -2289,6 +2298,8 @@
                 ms.enable_thinking = null;
                 ms.enableThinkingBudget = false;
                 ms.thinking_budget_tokens = null;
+                ms.enableGpuPowerLimit = false;
+                ms.gpu_power_limit_w = null;
                 ms.enableToolResultLimit = false;
                 ms.max_tool_result_tokens = null;
                 ms.ctKwargEntries = [];
@@ -2312,6 +2323,10 @@
                     } else if (k === 'max_tool_result_tokens') {
                         ms.enableToolResultLimit = s[k] != null;
                         ms.max_tool_result_tokens = s[k] ?? null;
+                    } else if (k === 'gpu_power_limit_w') {
+                        // Profiles may store 0 for "off".
+                        ms.enableGpuPowerLimit = s[k] > 0;
+                        ms.gpu_power_limit_w = s[k] > 0 ? s[k] : null;
                     } else if (k === 'guided_grammar_enabled') {
                         ms.guided_grammar_enabled = !!s[k];
                     } else if (k === 'guided_grammar') {
@@ -3025,6 +3040,15 @@
                         || model?.settings?.qwen35_oq_a8_enabled === true);
             },
 
+            validateGpuPowerLimit() {
+                if (!this.modelSettings.enableGpuPowerLimit) return null;
+                const watts = Number(this.modelSettings.gpu_power_limit_w);
+                if (!Number.isInteger(watts) || watts < 2 || watts > 1000) {
+                    return window.t('js.error.gpu_power_limit_range');
+                }
+                return null;
+            },
+
             validateQwenOqA8Settings() {
                 if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
                 // Both wrap the same MLP call, so the combination silently
@@ -3180,6 +3204,9 @@
                     thinking_budget_enabled: ms.enableThinkingBudget,
                     thinking_budget_tokens: ms.enableThinkingBudget
                         ? (ms.thinking_budget_tokens || null)
+                        : 0,
+                    gpu_power_limit_w: ms.enableGpuPowerLimit
+                        ? (Number(ms.gpu_power_limit_w) || 0)
                         : 0,
                     guided_grammar_enabled: ms.guided_grammar_enabled,
                     guided_grammar: ms.guided_grammar_enabled
@@ -3358,6 +3385,12 @@
                     return;
                 }
 
+                const gpuPowerLimitError = this.validateGpuPowerLimit();
+                if (gpuPowerLimitError) {
+                    alert(gpuPowerLimitError);
+                    return;
+                }
+
                 this.savingModelSettings = true;
                 try {
                     const payload = this.buildModelSettingsPayload(this.modelSettings);
@@ -3400,7 +3433,8 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.save_model_settings_failed'));
+                        // Request validation errors (422) carry a list of objects.
+                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_model_settings_failed')));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
@@ -3594,6 +3628,8 @@
                         this.modelSettings.enable_thinking = false;
                         this.modelSettings.enableThinkingBudget = false;
                         this.modelSettings.thinking_budget_tokens = 0;
+                        this.modelSettings.enableGpuPowerLimit = false;
+                        this.modelSettings.gpu_power_limit_w = null;
                         this.modelSettings.enableToolResultLimit = false;
                         this.modelSettings.max_tool_result_tokens = 0;
                         this.modelSettings.ctKwargEntries = [];
@@ -5262,6 +5298,12 @@
                 if (capped === 'target') return window.t('ctx_bench.capped.target');
                 if (capped === 'native') return window.t('ctx_bench.capped.native');
                 return window.t('ctx_bench.capped.memory');
+            },
+
+            // A model's GPU power limit; benchmarks always run without it.
+            benchGpuPowerLimit(modelId) {
+                const m = this.models.find(m => m.id === modelId);
+                return m?.settings?.gpu_power_limit_w || 0;
             },
 
             // Native context length of the selected bench model (0 = unknown).

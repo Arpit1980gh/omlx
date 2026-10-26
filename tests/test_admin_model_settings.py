@@ -286,6 +286,31 @@ def _idle_engine() -> MagicMock:
 
 
 @pytest.mark.asyncio
+async def test_gpu_power_limit_saves_without_reload():
+    pool, entry = _failed_pool()
+    entry.engine = _idle_engine()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+    settings = ModelSettings()
+
+    def request(watts):
+        return admin_routes.ModelSettingsRequest(gpu_power_limit_w=watts)
+
+    result = await _update_settings(pool, settings, request(10))
+    assert settings.gpu_power_limit_w == 10
+    assert result["requires_reload"] is False
+    pool._unload_engine.assert_not_awaited()
+
+    await _update_settings(pool, settings, request(0))
+    assert settings.gpu_power_limit_w is None
+
+    # Profiles and templates go through the same request model.
+    with pytest.raises(pydantic.ValidationError):
+        request(1)
+    assert admin_routes._normalize_profile_settings({"gpu_power_limit_w": 0}) == {}
+
+
+@pytest.mark.asyncio
 async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
