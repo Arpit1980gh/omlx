@@ -1,7 +1,8 @@
 // Ask AI settings. Everything here is app-side state (`ask-ai.json` under
 // Application Support), so edits apply at once without an Apply button.
 // Sections:
-//   - Ask AI - feature switch, global hotkey, conversation reuse window.
+//   - Ask AI - feature switch, global hotkey, conversation reuse window,
+//     GPU power limit.
 //   - Default - model and prompt for questions without a slash command.
 //   - Presets - `/command` entries with their own model and system prompt.
 
@@ -13,11 +14,14 @@ struct AskAIScreen: View {
     /// missing while the server is still starting.
     @State private var models: [String]?
     @State private var modelsUnavailable = false
+    /// Nil until the server answers; every model reports the same host value.
+    @State private var gpuPowerLimitSupported: Bool?
 
     var body: some View {
         let askAI = services.askAI
         VStack(alignment: .leading, spacing: 0) {
-            GeneralSection(controller: askAI, store: askAI.store)
+            GeneralSection(controller: askAI, store: askAI.store,
+                           gpuPowerLimitSupported: gpuPowerLimitSupported)
             if askAI.store.prefs.enabled {
                 DefaultSection(store: askAI.store, models: models)
                 PresetsSection(store: askAI.store, models: models)
@@ -44,6 +48,7 @@ struct AskAIScreen: View {
     private func loadModels() async {
         do {
             let all = try await services.client.listModels().models
+            gpuPowerLimitSupported = all.first?.gpuPowerLimitSupported
             models = all.filter { model in
                 let type = model.modelType ?? ""
                 return (type.isEmpty || type == "llm" || type == "vlm") && model.virtual != true
@@ -82,6 +87,8 @@ struct AskAIScreen: View {
 private struct GeneralSection: View {
     let controller: AskAIController
     @Bindable var store: AskAIStore
+    let gpuPowerLimitSupported: Bool?
+    @State private var gpuPowerLimitText = ""
 
     @Environment(\.omlxTheme) private var theme
 
@@ -129,8 +136,7 @@ private struct GeneralSection: View {
                                   comment: "Row label for the idle time that resets the Ask AI conversation"),
                     sublabel: String(localized: "askai.row.new_conversation.sub",
                                      defaultValue: "Reopening the bar sooner keeps the last conversation for follow-up questions.",
-                                     comment: "Sublabel for the Ask AI conversation reset time"),
-                    isLast: true
+                                     comment: "Sublabel for the Ask AI conversation reset time")
                 ) {
                     Popup(selection: $store.prefs.newConversationAfter, width: .controlCompact, options: [
                         (0, String(localized: "askai.new_conversation.always", defaultValue: "Every Time",
@@ -142,6 +148,34 @@ private struct GeneralSection: View {
                         (900, String(localized: "askai.new_conversation.15m", defaultValue: "15 Minutes",
                                      comment: "Ask AI option: new conversation after 15 idle minutes")),
                     ])
+                }
+                Row(
+                    label: String(localized: "askai.row.gpu_power_limit",
+                                  defaultValue: "GPU Power Limit",
+                                  comment: "Row label for the GPU power limit while Ask AI answers"),
+                    sublabel: gpuPowerLimitSupported == false
+                        ? GPUPowerGuide.unsupportedText
+                        : String(localized: "askai.row.gpu_power_limit.sub",
+                                 defaultValue: "Caps GPU power for the whole Mac while Ask AI answers, to save battery (2 to 1000 W). If the model also has a limit, the lower one applies.",
+                                 comment: "Sublabel for the Ask AI GPU power limit"),
+                    isLast: true
+                ) {
+                    HStack(spacing: 8) {
+                        if store.prefs.gpuPowerLimitEnabled {
+                            // Text state so a cleared field shows the range placeholder.
+                            TextInput(text: $gpuPowerLimitText,
+                                      placeholder: "2-1000", mono: true, isNumeric: true,
+                                      range: 2...1000, step: 1, suffix: "W",
+                                      width: .controlCompact)
+                                .onAppear { gpuPowerLimitText = String(store.prefs.gpuPowerLimitWatts) }
+                                .onChange(of: gpuPowerLimitText) { _, text in
+                                    if let watts = Int(text) { store.prefs.gpuPowerLimitWatts = watts }
+                                }
+                        }
+                        GPUPowerGuideButton()
+                        RowSwitch(isOn: $store.prefs.gpuPowerLimitEnabled)
+                            .disabled(gpuPowerLimitSupported == false && !store.prefs.gpuPowerLimitEnabled)
+                    }
                 }
             }
         }

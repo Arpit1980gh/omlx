@@ -75,6 +75,13 @@ final class AskAITests: XCTestCase {
             with: ChatCompletionBody(model: "m", messages: messages, allowThinking: true).encoded()
         ) as! [String: Any]
         XCTAssertNil(on["chat_template_kwargs"])
+        XCTAssertNil(on["gpu_power_limit_w"])
+
+        let capped = try JSONSerialization.jsonObject(
+            with: ChatCompletionBody(model: "m", messages: messages, allowThinking: true,
+                                     gpuPowerLimitW: 10).encoded()
+        ) as! [String: Any]
+        XCTAssertEqual(capped["gpu_power_limit_w"] as? Int, 10)
 
         let withImage = ChatMessage(role: .user, content: "What is this?", imageURLs: ["data:image/jpeg;base64,AAAA"])
         let body = try JSONSerialization.jsonObject(
@@ -96,11 +103,23 @@ final class AskAITests: XCTestCase {
         XCTAssertEqual(prefs.panelWidth, AskAIPrefs.defaultPanelWidth)
         XCTAssertEqual(prefs.presets.first?.command, "tldr")
         XCTAssertEqual(prefs.presets.first?.allowThinking, false)
+        XCTAssertFalse(prefs.gpuPowerLimitEnabled)
+        XCTAssertNil(prefs.requestGPUPowerLimit)
+    }
+
+    func testGPUPowerLimitIsClampedToTheServerRange() throws {
+        let json = #"{"gpuPowerLimitEnabled":true,"gpuPowerLimitWatts":1}"#
+        var prefs = try JSONDecoder().decode(AskAIPrefs.self, from: Data(json.utf8))
+        XCTAssertEqual(prefs.requestGPUPowerLimit, 2)
+        prefs.gpuPowerLimitWatts = 12
+        XCTAssertEqual(prefs.requestGPUPowerLimit, 12)
+        prefs.gpuPowerLimitEnabled = false
+        XCTAssertNil(prefs.requestGPUPowerLimit)
     }
 
     func testPrefsDecodeKeepsGoodFieldsWhenOthersAreMalformed() throws {
         let json = #"""
-        {"enabled":true,"hotKey":{"keyCode":49},"panelPosition":"left",
+        {"enabled":true,"hotKey":{"keyCode":49},"panelPosition":"left","gpuPowerLimitWatts":"ten",
          "presets":[{"id":"not-a-uuid","command":"tldr","model":"qwen"},{"command":7},
                     {"command":"번역","model":"gemma"}]}
         """#
@@ -108,6 +127,7 @@ final class AskAITests: XCTestCase {
         XCTAssertTrue(prefs.enabled)
         XCTAssertEqual(prefs.hotKey, .optionSpace)
         XCTAssertNil(prefs.panelPosition)
+        XCTAssertEqual(prefs.gpuPowerLimitWatts, 10)
         XCTAssertEqual(prefs.presets.map(\.command), ["tldr", "", "번역"])
     }
 

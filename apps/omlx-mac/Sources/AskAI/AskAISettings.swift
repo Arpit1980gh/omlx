@@ -82,6 +82,10 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
     /// Set after the user drags the panel; nil uses the default spot.
     var panelPosition: AskAIPanelPosition?
     var panelWidth = AskAIPrefs.defaultPanelWidth
+    /// System-wide GPU power cap while Ask AI answers. The server applies the
+    /// lower of this and the model's own limit.
+    var gpuPowerLimitEnabled = false
+    var gpuPowerLimitWatts = 10
 
     init() {}
 
@@ -101,6 +105,13 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
         presets = c.lenient([Lossy<AskAIPreset>].self, .presets)?.compactMap(\.value) ?? fallback.presets
         panelPosition = c.lenient(AskAIPanelPosition.self, .panelPosition)
         panelWidth = c.lenient(Double.self, .panelWidth) ?? fallback.panelWidth
+        gpuPowerLimitEnabled = c.lenient(Bool.self, .gpuPowerLimitEnabled) ?? fallback.gpuPowerLimitEnabled
+        gpuPowerLimitWatts = c.lenient(Int.self, .gpuPowerLimitWatts) ?? fallback.gpuPowerLimitWatts
+    }
+
+    /// The `gpu_power_limit_w` to send, clamped to what the server accepts.
+    var requestGPUPowerLimit: Int? {
+        gpuPowerLimitEnabled ? min(max(gpuPowerLimitWatts, 2), 1000) : nil
     }
 
     var defaultProfile: AskAIProfile {

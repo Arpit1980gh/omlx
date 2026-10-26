@@ -292,6 +292,7 @@ final class AskAIController {
         // A reset during the image check leaves nothing to follow up on.
         // Keep the input so the user can send again.
         guard conversation.send(pending.text, images: images,
+                                gpuPowerLimitW: store.prefs.requestGPUPowerLimit,
                                 using: ChatCompletionClient(url: url, apiKey: config.apiKey))
         else { return }
         if draft == submittedDraft { draft = "" }

@@ -79,12 +79,14 @@ final class AskAIConversation {
 
     /// Returns false when there is no profile or an answer is still streaming.
     @discardableResult
-    func send(_ question: String, images: [AskAIImage] = [], using client: ChatCompletionClient) -> Bool {
+    func send(_ question: String, images: [AskAIImage] = [], gpuPowerLimitW: Int? = nil,
+              using client: ChatCompletionClient) -> Bool {
         guard let profile, !isStreaming else { return false }
         let body = ChatCompletionBody(
             model: profile.model,
             messages: Self.messages(profile: profile, history: turns, question: question, images: images),
-            allowThinking: profile.allowThinking
+            allowThinking: profile.allowThinking,
+            gpuPowerLimitW: gpuPowerLimitW
         )
         let turn = Turn(question: question, images: images)
         turns.append(turn)

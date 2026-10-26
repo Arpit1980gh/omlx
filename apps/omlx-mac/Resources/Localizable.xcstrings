@@ -34466,6 +34466,54 @@
           }
         }
       }
+    },
+    "askai.row.gpu_power_limit" : {
+      "comment" : "Row label for the GPU power limit while Ask AI answers",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU Power Limit"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ограничение мощности GPU"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 功率限制"
+          }
+        }
+      }
+    },
+    "askai.row.gpu_power_limit.sub" : {
+      "comment" : "Sublabel for the Ask AI GPU power limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Caps GPU power for the whole Mac while Ask AI answers, to save battery (2 to 1000 W). If the model also has a limit, the lower one applies."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ограничивает мощность GPU для всего Mac, пока Ask AI отвечает, чтобы экономить батарею (от 2 до 1000 Вт). Если у модели тоже есть лимит, действует меньший."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在 Ask AI 回答期间限制整台 Mac 的 GPU 功率以节省电量（2 到 1000 W）。如果模型也设置了限制，则采用较低的值。"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

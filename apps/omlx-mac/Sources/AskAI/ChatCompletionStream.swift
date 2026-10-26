@@ -75,16 +75,18 @@ struct ChatCompletionBody: Encodable {
     let messages: [Message]
     let stream = true
     let chatTemplateKwargs: TemplateKwargs?
+    let gpuPowerLimitW: Int?
 
     /// Thinking off sends `enable_thinking: false`. Thinking on sends nothing,
     /// so the model's own setting applies. The server ignores the value for
     /// models whose template forces it.
-    init(model: String, messages: [ChatMessage], allowThinking: Bool) {
+    init(model: String, messages: [ChatMessage], allowThinking: Bool, gpuPowerLimitW: Int? = nil) {
         self.model = model
         self.messages = messages.map {
             Message(role: $0.role.rawValue, content: $0.content, imageURLs: $0.imageURLs)
         }
         self.chatTemplateKwargs = allowThinking ? nil : TemplateKwargs(enableThinking: false)
+        self.gpuPowerLimitW = gpuPowerLimitW
     }
 
     func encoded() throws -> Data {
