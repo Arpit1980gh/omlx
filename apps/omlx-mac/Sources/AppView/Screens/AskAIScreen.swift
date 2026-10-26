@@ -93,7 +93,7 @@ private struct GeneralSection: View {
         ListGroup {
             Row(
                 label: String(localized: "askai.row.enabled",
-                              defaultValue: "Ask AI Function",
+                              defaultValue: "Enable Ask AI",
                               comment: "Row label for the Ask AI feature switch"),
                 sublabel: String(localized: "askai.row.enabled.sub",
                                  defaultValue: "Open a question bar from any app with a global shortcut.",

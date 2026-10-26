@@ -33088,19 +33088,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Ask AI Function"
+            "value" : "Enable Ask AI"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Функция Ask AI"
+            "value" : "Включить Ask AI"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Ask AI 功能"
+            "value" : "启用 Ask AI"
           }
         }
       }
