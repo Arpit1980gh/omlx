@@ -188,6 +188,28 @@ private final class AskAITextView: NSTextView {
         super.paste(sender)
     }
 
+    // An image drop attaches like Command-V instead of inserting the path.
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        carriesImages(sender) ? .copy : super.draggingEntered(sender)
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        carriesImages(sender) ? .copy : super.draggingUpdated(sender)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard carriesImages(sender),
+              coordinator?.parent.onPasteImages(sender.draggingPasteboard) == true
+        else { return super.performDragOperation(sender) }
+        window?.makeKey()
+        window?.makeFirstResponder(self)
+        return true
+    }
+
+    private func carriesImages(_ sender: NSDraggingInfo) -> Bool {
+        !AskAIImage.sources(on: sender.draggingPasteboard).isEmpty
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard window?.firstResponder === self,
               let coordinator,

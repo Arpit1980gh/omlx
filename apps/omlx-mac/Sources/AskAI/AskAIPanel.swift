@@ -39,6 +39,40 @@ private final class AskAIPanel: NSPanel {
     }
 }
 
+/// Takes image drops anywhere on the panel. The prompt field handles drops
+/// over itself, so this covers the transcript, footer, and margins.
+private final class AskAIHostingView: NSHostingView<AnyView> {
+    var onDropImages: ((NSPasteboard) -> Bool)?
+
+    required init(rootView: AnyView) {
+        super.init(rootView: rootView)
+        registerForDraggedTypes(AskAIImage.dropTypes)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not used")
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        carriesImages(sender) ? .copy : []
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        carriesImages(sender) ? .copy : []
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard carriesImages(sender), onDropImages?(sender.draggingPasteboard) == true else { return false }
+        window?.makeKey()
+        return true
+    }
+
+    private func carriesImages(_ sender: NSDraggingInfo) -> Bool {
+        !AskAIImage.sources(on: sender.draggingPasteboard).isEmpty
+    }
+}
+
 /// Callbacks from the panel's SwiftUI content to the window controller.
 struct AskAIPanelChrome {
     let heightChanged: (CGFloat) -> Void
@@ -60,7 +94,7 @@ final class AskAIPanelController: NSObject, NSWindowDelegate {
 
     private let panel = AskAIPanel()
     private weak var controller: AskAIController?
-    private var hosting: NSHostingView<AnyView>?
+    private var hosting: AskAIHostingView?
     private var contentHeight: CGFloat = 64
     private var width = CGFloat(AskAIPrefs.defaultPanelWidth)
     /// Top-left corner of the panel in screen coordinates.
@@ -85,7 +119,12 @@ final class AskAIPanelController: NSObject, NSWindowDelegate {
         )
         let root = AskAIPanelView(controller: controller, chrome: chrome)
             .omlxThemed()
-        let hosting = NSHostingView(rootView: AnyView(root))
+        let hosting = AskAIHostingView(rootView: AnyView(root))
+        hosting.onDropImages = { [weak controller] pasteboard in
+            guard let controller, controller.attachImages(from: pasteboard) else { return false }
+            controller.inputFocus.focus()
+            return true
+        }
         // The controller sizes the window; SwiftUI only reports its height.
         hosting.sizingOptions = []
         // Round the window itself, not only the SwiftUI shape, so the system

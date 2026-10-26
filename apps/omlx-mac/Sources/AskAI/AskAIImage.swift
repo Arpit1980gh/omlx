@@ -49,6 +49,11 @@ final class AskAIImage: Identifiable, Equatable, @unchecked Sendable {
         return [.data(data)]
     }
 
+    /// Pasteboard types to register for so image drops reach the panel.
+    static var dropTypes: [NSPasteboard.PasteboardType] {
+        [.fileURL] + NSImage.imageTypes.map { NSPasteboard.PasteboardType($0) }
+    }
+
     /// Decoding, downscaling, and encoding a large image takes hundreds of
     /// milliseconds, so it runs off the main actor.
     static func make(from source: Source) async -> AskAIImage? {
