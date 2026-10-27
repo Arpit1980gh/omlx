@@ -345,7 +345,8 @@ _NUMERICS_REVISIONS = {
     # mlx-lm a63e24c scales the GDN q/k l2norm eps by inv_scale**2.
     "mlx_lm.models.qwen3_5": "gdn-qk-norm-2",
     "mlx_lm.models.qwen3_next": "gdn-qk-norm-2",
-    "mlx_lm.models.bailing_hybrid": "gdn-qk-norm-2",
+    # Ling's 2-9 row MLA forwards also moved to the absorbed path.
+    "mlx_lm.models.bailing_hybrid": "gdn-qk-norm-2+mla-absorbed-1",
     # omlx.patches.qwen35_gdn_prework applies the same fix to mlx-vlm.
     "mlx_vlm.models.qwen3_5.language": "gdn-qk-norm-2",
     # mlx-lm 0d4d3d04 changes these forwards: the YaRN ``truncate`` flag of
