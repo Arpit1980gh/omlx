@@ -617,6 +617,7 @@ def _canonical_qwen4_decode_module(signatures):
         ((6, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 0
         ((4, 64), (5, 128), (5, 128), (5, 128)),  # physical layer 1
         ((5, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 29
+        ((8, 64), (8, 64), (8, 64), (8, 64)),  # re-quantized oQ4e, every layer
     ],
 )
 def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(signatures):
@@ -1174,6 +1175,7 @@ def patched_decode(monkeypatch):
     [
         ((6, 64), (6, 64), (6, 64), (6, 64)),  # one fused in-projection launch
         ((4, 64), (5, 128), (5, 128), (5, 128)),  # four projection launches
+        ((8, 64), (8, 64), (8, 64), (8, 64)),  # re-quantized oQ4e
     ],
 )
 @pytest.mark.parametrize("seed", [3, 11])
@@ -1249,8 +1251,8 @@ def test_qwen4_decode_plan_turns_ineligible_on_replacement(monkeypatch):
         mx.zeros((1, HV, DV, DK)),
     )
     assert not fallbacks
-    # 8-bit in-projections are outside the shipped allocation allow-list.
-    module.in_proj_qkv = _random_projection(2560, C, 8, 64)
+    # 8-bit/g128 in-projections are outside the shipped allocation allow-list.
+    module.in_proj_qkv = _random_projection(2560, C, 8, 128)
     _decode_steps(
         module,
         [mx.zeros((1, 1, 2560), dtype=mx.bfloat16)],
@@ -1455,9 +1457,10 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
 @pytest.mark.parametrize("rows", [2, 3])
 def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
-    monkeypatch, qwen4_verify, rows
+    monkeypatch, qwen4_verify, signatures, rows
 ):
     """Up to the per-row projection limit, every row of a batched one-token
     decode, and its next conv and recurrent states, equal that row decoded
@@ -1465,7 +1468,7 @@ def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
     from mlx_vlm.models.cache import ArraysCache
 
     assert rows <= prework_mod._QWEN4_BATCH_ROW_EXACT_ROWS
-    module = _real_qwen4_decode_module(((6, 64),) * 4, 17)
+    module = _real_qwen4_decode_module(signatures, 17)
     mx.random.seed(rows)
     inputs = (mx.random.normal((rows, 1, 2560)) * 0.5).astype(mx.bfloat16)
     conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(mx.bfloat16)
