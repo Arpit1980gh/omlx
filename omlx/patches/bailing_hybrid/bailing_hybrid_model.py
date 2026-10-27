@@ -783,6 +783,12 @@ class Model(nn.Module):
             kv_b_key = f"{prefix}.attention.kv_b_proj.weight"
             if kv_b_key in weights:
                 v = weights.pop(kv_b_key)
+                # The split halves carry no scale sidecar (Ling 3.1 FP8).
+                scale_key = f"{kv_b_key}_scale_inv"
+                if scale_key in weights and v.dtype == mx.uint8:
+                    v = self._dequantize_fp8_block(
+                        kv_b_key, v, weights.pop(scale_key)
+                    )
                 head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
                 num_heads = self.args.num_attention_heads
                 v = v.reshape(num_heads, head_dim, -1)
@@ -794,6 +800,49 @@ class Model(nn.Module):
                 weights[f"{prefix}.attention.unembed_out.weight"] = wv
 
         return self._convert_fp8_block_weights(weights)
+
+    def _dequantize_fp8_block(self, weight_key, weight, scale):
+        quantization_config = self.args.quantization_config or {}
+        block_size = quantization_config.get("weight_block_size", (128, 128))
+        if not isinstance(block_size, (list, tuple)) or len(block_size) != 2:
+            block_size = (128, 128)
+        block_rows, block_cols = (int(block_size[0]), int(block_size[1]))
+
+        if scale.dtype == mx.uint8:
+            scale = mx.power(
+                mx.array(2.0, dtype=mx.float32),
+                scale.astype(mx.float32) - 127.0,
+            )
+        else:
+            scale = scale.astype(mx.float32)
+        weight = mx.from_fp8(weight, dtype=mx.float32)
+        out_dim, in_dim = weight.shape[-2:]
+        target_out = scale.shape[-2] * block_rows
+        target_in = scale.shape[-1] * block_cols
+        if target_out < out_dim or target_in < in_dim:
+            raise ValueError(
+                f"Invalid FP8 block scale for {weight_key}: weight "
+                f"{weight.shape}, scale {scale.shape}, block {block_size}"
+            )
+
+        pad_out = target_out - out_dim
+        pad_in = target_in - in_dim
+        if pad_out or pad_in:
+            padding = [(0, 0)] * (weight.ndim - 2)
+            padding.extend(((0, pad_out), (0, pad_in)))
+            weight = mx.pad(weight, padding)
+
+        lead = weight.shape[:-2]
+        weight = weight.reshape(
+            *lead,
+            scale.shape[-2],
+            block_rows,
+            scale.shape[-1],
+            block_cols,
+        )
+        weight = weight * scale[..., :, None, :, None]
+        weight = weight.reshape(*lead, target_out, target_in)
+        return weight[..., :out_dim, :in_dim].astype(mx.bfloat16)
 
     def _convert_fp8_block_weights(self, weights):
         """Convert Ling's published FP8 and MXFP4 tensor layouts for MLX.
@@ -809,11 +858,6 @@ class Model(nn.Module):
         rename the scale sidecar instead of dequantizing the experts.
         """
         quantization_config = self.args.quantization_config or {}
-        block_size = quantization_config.get("weight_block_size", (128, 128))
-        if not isinstance(block_size, (list, tuple)) or len(block_size) != 2:
-            block_size = (128, 128)
-        block_rows, block_cols = (int(block_size[0]), int(block_size[1]))
-
         scale_keys = [key for key in weights if key.endswith(".weight_scale_inv")]
         for scale_key in scale_keys:
             weight_key = scale_key[: -len("_scale_inv")]
@@ -838,43 +882,9 @@ class Model(nn.Module):
             if source_weight.dtype != mx.uint8:
                 continue
 
-            scale = weights.pop(scale_key)
-            if scale.dtype == mx.uint8:
-                scale = mx.power(
-                    mx.array(2.0, dtype=mx.float32),
-                    scale.astype(mx.float32) - 127.0,
-                )
-            else:
-                scale = scale.astype(mx.float32)
-            weight = mx.from_fp8(weights.pop(weight_key), dtype=mx.float32)
-            out_dim, in_dim = weight.shape[-2:]
-            target_out = scale.shape[-2] * block_rows
-            target_in = scale.shape[-1] * block_cols
-            if target_out < out_dim or target_in < in_dim:
-                raise ValueError(
-                    f"Invalid FP8 block scale for {weight_key}: weight "
-                    f"{weight.shape}, scale {scale.shape}, block {block_size}"
-                )
-
-            pad_out = target_out - out_dim
-            pad_in = target_in - in_dim
-            if pad_out or pad_in:
-                padding = [(0, 0)] * (weight.ndim - 2)
-                padding.extend(((0, pad_out), (0, pad_in)))
-                weight = mx.pad(weight, padding)
-
-            lead = weight.shape[:-2]
-            weight = weight.reshape(
-                *lead,
-                scale.shape[-2],
-                block_rows,
-                scale.shape[-1],
-                block_cols,
+            weight = self._dequantize_fp8_block(
+                weight_key, weights.pop(weight_key), weights.pop(scale_key)
             )
-            weight = weight * scale[..., :, None, :, None]
-            weight = weight.reshape(*lead, target_out, target_in)
-            weight = weight[..., :out_dim, :in_dim].astype(mx.bfloat16)
-
             quantized, scales, biases = mx.quantize(weight, group_size=64, bits=8)
             weights[weight_key] = quantized
             base = weight_key[: -len("weight")]

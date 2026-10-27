@@ -498,6 +498,33 @@ def test_sanitize_converts_block_fp8_weights_to_affine_runtime_layout():
     assert mx.allclose(restored, expected, rtol=2e-2, atol=5e-3)
 
 
+def test_sanitize_dequantizes_fp8_kv_b_proj_before_mla_split():
+    bailing_hybrid = _load_patch_module()
+    config = _minimal_config(
+        quantization_config={"quant_method": "fp8", "weight_block_size": [128, 128]}
+    )
+    model = bailing_hybrid.Model(bailing_hybrid.ModelArgs.from_dict(config))
+    kv_b_key = "model.layers.1.attention.kv_b_proj.weight"
+    fp8 = mx.to_fp8(mx.linspace(-1.0, 1.0, 16 * 8).reshape(16, 8))
+
+    sanitized = model.sanitize(
+        {kv_b_key: fp8, f"{kv_b_key}_scale_inv": mx.array([[0.5]], dtype=mx.float32)}
+    )
+    expected = (mx.from_fp8(fp8, dtype=mx.float32) * 0.5).reshape(2, 8, 8)
+
+    assert not any(key.endswith("weight_scale_inv") for key in sanitized)
+    assert mx.allclose(
+        sanitized["model.layers.1.attention.embed_q.weight"].astype(mx.float32),
+        expected[:, :4].swapaxes(-1, -2),
+        atol=5e-3,
+    )
+    assert mx.allclose(
+        sanitized["model.layers.1.attention.unembed_out.weight"].astype(mx.float32),
+        expected[:, 4:],
+        atol=5e-3,
+    )
+
+
 def test_sanitize_stacks_fp8_expert_weights_and_sidecars():
     bailing_hybrid = _load_patch_module()
     config = _minimal_config(
