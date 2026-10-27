@@ -418,8 +418,14 @@ def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
             "bits": 4,
             "mode": "mxfp4",
         }
-        for layer_idx in range(first_sparse_layer, num_hidden_layers):
-            base = f"model.layers.{layer_idx}.mlp.switch_mlp"
+        bases = [
+            f"model.layers.{layer_idx}.mlp.switch_mlp"
+            for layer_idx in range(first_sparse_layer, num_hidden_layers)
+        ]
+        # Sanitize moves the nextn layer, MXFP4 experts included, to mtp.0.
+        if int(cfg.get("num_nextn_predict_layers") or 0):
+            bases.append("mtp.0.mlp.switch_mlp")
+        for base in bases:
             for projection in ("gate_proj", "up_proj", "down_proj"):
                 quantization[f"{base}.{projection}"] = dict(expert_quantization)
 
@@ -1442,9 +1448,9 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
     fork PR 15), MiMo V2/2.6 Flash, GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids
-    (nemotron_h) and Gemma 4 merged-assistant checkpoints (gemma4 and
-    gemma4_unified, VLM path only). The model also has to declare MTP heads in
-    the config; otherwise the patch is a no-op.
+    (nemotron_h), Ling 3.x Flash (bailing_hybrid) and Gemma 4 merged-assistant
+    checkpoints (gemma4 and gemma4_unified, VLM path only). The model also has
+    to declare MTP heads in the config; otherwise the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -1461,6 +1467,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type in ("gemma4", "gemma4_unified")
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
+        or model_type == "bailing_hybrid"
     )
 
 
