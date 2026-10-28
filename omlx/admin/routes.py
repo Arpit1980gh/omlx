@@ -6757,14 +6757,13 @@ def _build_runtime_cache_observability(
         try:
             num_files = 0
             total_bytes = 0
-            for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
-                for subdir in "0123456789abcdef":
-                    subdir_path = root / subdir
-                    if not subdir_path.exists():
-                        continue
-                    for f in subdir_path.glob("*.safetensors"):
-                        num_files += 1
-                        total_bytes += f.stat().st_size
+            for subdir in "0123456789abcdef":
+                subdir_path = cache_dir / subdir
+                if not subdir_path.exists():
+                    continue
+                for f in subdir_path.glob("*.safetensors"):
+                    num_files += 1
+                    total_bytes += f.stat().st_size
             sidecar_count, sidecar_bytes = _scan_offline_gdn_sidecars(cache_dir)
             payload["total_num_files"] = num_files + sidecar_count
             payload["total_size_bytes"] = total_bytes + sidecar_bytes
@@ -7356,17 +7355,16 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
         )
         if cache_dir.exists():
             try:
-                for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
-                    for subdir in "0123456789abcdef":
-                        subdir_path = root / subdir
-                        if not subdir_path.exists():
-                            continue
-                        for f in subdir_path.glob("*.safetensors"):
-                            try:
-                                f.unlink()
-                                total_deleted += 1
-                            except OSError:
-                                pass
+                for subdir in "0123456789abcdef":
+                    subdir_path = cache_dir / subdir
+                    if not subdir_path.exists():
+                        continue
+                    for f in subdir_path.glob("*.safetensors"):
+                        try:
+                            f.unlink()
+                            total_deleted += 1
+                        except OSError:
+                            pass
                 sidecar_count, _ = _scan_offline_gdn_sidecars(cache_dir, clear=True)
                 total_deleted += sidecar_count
             except Exception as exc:

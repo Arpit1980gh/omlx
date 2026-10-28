@@ -5,6 +5,10 @@ import numpy as np
 import pytest
 from test_deepseek_v41 import load_reference_weights, tiny_ced
 
+from omlx.cache.paged_ssd_cache import (
+    PagedSSDCacheManager,
+    numerics_revision_for_model,
+)
 from omlx.models.vlm import VLMModelAdapter
 from omlx.patches.deepseek_v41.language import Attention
 from omlx.patches.deepseek_v41.model import Model
@@ -104,48 +108,47 @@ def test_dspark_ring_and_rollback_after_ced_prefill():
     )
 
 
-@pytest.mark.asyncio
-async def test_clear_ssd_removes_both_modes_when_model_is_unloaded(
-    tmp_path, monkeypatch
-):
-    from types import SimpleNamespace
+def test_ced_and_full_prefill_blocks_share_one_ssd_budget(tmp_path):
+    full = numerics_revision_for_model(
+        VLMModelAdapter(Model(tiny_ced(ced_prefill=False)))
+    )
+    ced = numerics_revision_for_model(VLMModelAdapter(Model(tiny_ced())))
+    assert full is None
+    assert ced == "ced-prefill-1"
 
-    from omlx.admin import routes
+    data = [(mx.zeros((1, 2, 32, 8)), mx.zeros((1, 2, 32, 8)))]
 
-    files = []
-    for root in (tmp_path, tmp_path / "deepseek_v41_ced_v1"):
-        folder = root / "a"
-        folder.mkdir(parents=True)
-        file = folder / "abc.safetensors"
-        file.write_bytes(b"cache")
-        files.append(file)
-    monkeypatch.setattr(
-        routes,
-        "_get_engine_pool",
-        lambda: SimpleNamespace(get_status=lambda: {"models": []}, _entries={}),
-    )
-    monkeypatch.setattr(
-        routes,
-        "_get_global_settings",
-        lambda: SimpleNamespace(
-            base_path=tmp_path,
-            cache=SimpleNamespace(get_ssd_cache_dir=lambda _: tmp_path),
-        ),
-    )
-    monkeypatch.setattr(
-        routes, "_clear_cold_remote_cluster_cache_roots", lambda _: (0, 0)
-    )
-    settings = SimpleNamespace(
-        base_path=tmp_path,
-        cache=SimpleNamespace(
-            ssd_cache_max_size="1KB",
-            get_ssd_cache_dir=lambda _: tmp_path,
-            get_ssd_cache_max_size_bytes=lambda _: 1024,
-        ),
-    )
-    stats = routes._build_runtime_cache_observability(settings)
-    assert stats["total_num_files"] == 2
-    assert stats["total_size_bytes"] == 10
-    result = await routes.clear_ssd_cache(is_admin=True)
-    assert result["total_deleted"] == 2
-    assert not any(file.exists() for file in files)
+    def open_manager(numerics, max_size):
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path,
+            max_size_bytes=max_size,
+            expected_model_name="v41",
+            expected_num_layers=1,
+            expected_block_size=32,
+        )
+        manager.set_expected_layer_signature(["KVCache"], numerics=numerics)
+        manager.invalidate_stale_layer_signature()
+        return manager
+
+    def save(manager, block_hash):
+        assert manager.save_block(
+            block_hash, data, 32, model_name="v41", layer_cache_types=["KVCache"]
+        )
+
+    manager = open_manager(ced, 1 << 30)
+    save(manager, b"\x01" * 32)
+    manager.close()
+    (ced_file,) = tmp_path.glob("*/*.safetensors")
+    block_size = ced_file.stat().st_size
+
+    # Full prefill must not hit the CED block, but still counts and evicts it.
+    manager = open_manager(full, block_size * 3 // 2)
+    assert not manager.has_block(b"\x01" * 32)
+    assert manager._incompatible_index.total_size == block_size
+    save(manager, b"\x02" * 32)
+    manager.close()
+    assert not ced_file.exists()
+
+    manager = open_manager(ced, 1 << 30)
+    assert not manager.has_block(b"\x02" * 32)
+    manager.close()

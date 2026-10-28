@@ -31,6 +31,7 @@ from omlx.server import (
     ServerState,
     _format_generation_speed_for_log,
     _reject_diffusion_structured_outputs,
+    _remove_legacy_ced_ssd_cache_for_server,
     _reset_boundary_snapshots_for_server,
     _resolve_metric_durations,
     app,
@@ -76,6 +77,24 @@ class TestBoundarySnapshotLifecycle:
             _reset_boundary_snapshots_for_server()
 
         assert stale_dir.exists()
+
+
+def test_legacy_ced_ssd_cache_is_removed_and_root_kept(tmp_path):
+    root_block = tmp_path / "a" / "root.safetensors"
+    legacy_block = tmp_path / "deepseek_v41_ced_v1" / "a" / "ced.safetensors"
+    for block in (root_block, legacy_block):
+        block.parent.mkdir(parents=True)
+        block.write_text("cache")
+
+    state = ServerState()
+    state.engine_pool = SimpleNamespace(
+        _scheduler_config=SimpleNamespace(paged_ssd_cache_dir=tmp_path)
+    )
+    with patch("omlx.server._server_state", state):
+        _remove_legacy_ced_ssd_cache_for_server()
+
+    assert not (tmp_path / "deepseek_v41_ced_v1").exists()
+    assert root_block.exists()
 
 
 @pytest.mark.asyncio

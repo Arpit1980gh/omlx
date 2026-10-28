@@ -2378,16 +2378,6 @@ class VLMBatchedEngine(BaseEngine):
             else SchedulerConfig()
         )
         scheduler_config.moe_offload_active = bool(moe_offload_wrapped)
-        if (
-            self._adapter.model_type == "deepseek_v41"
-            and self._adapter.config.ced_prefill
-            and scheduler_config.paged_ssd_cache_dir
-        ):
-            # Approximate decoder states must not become hits in full-prefill
-            # mode (or vice versa) after reloading the model with new settings.
-            scheduler_config.paged_ssd_cache_dir = str(
-                Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
-            )
 
         engine_config = EngineConfig(
             model_name=self._model_name,
