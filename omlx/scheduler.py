@@ -4824,6 +4824,13 @@ class Scheduler:
                 per_token = max(per_token, ewma)
             last_n_tokens = tracker.last_n_tokens_for(gathered_core)
             last_delta_bytes = tracker.last_delta_bytes_for(gathered_core)
+            # Charge an EWMA outlier only while its own prefill runs. Once
+            # admission rejects every full step, nothing else replaces it.
+            owner = tracker.outlier_owner_for(gathered_core)
+            if owner is not None:
+                request = self.requests.get(owner)
+                if request is None or request.status != RequestStatus.WAITING:
+                    last_delta_bytes = 0
             if last_n_tokens > 0 and last_delta_bytes > 0:
                 measured = last_delta_bytes / last_n_tokens
                 if measured > 0:
@@ -6101,6 +6108,7 @@ class Scheduler:
             delta,
             floor_sample=n_tokens <= min_chunk,
             gathered_core=gathered_core,
+            request_id=request_id,
         )
         logger.debug(
             "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB unowned_pool=%.2fMB per_token=%.1fKB ewma=%.1fKB observed_max=%.1fMB samples=%d",
