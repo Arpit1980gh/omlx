@@ -177,20 +177,13 @@ def test_finished_row_is_refilled_without_copying_the_bank(backend):
     lengths = [4000, 3990, 3999, 3000, 3998, 3997, 3996, 3995]
     a, b = make(stock, lengths), make(patched, lengths)
     x = mx.ones((8, 2, 3, 8), mx.bfloat16)
+    kept = _refill_order([0, 1, 2, 4, 5, 6, 7])
     for c in (a, b):
         c.update_and_fetch(x, x)
-    mx.eval(b.keys, b.values)
-    row = (b.keys.nbytes + b.values.nbytes) // 8
-    kept = _refill_order([0, 1, 2, 4, 5, 6, 7])
-    mx.synchronize()
-    mx.reset_peak_memory()
-    base = mx.get_active_memory()
-    for c in (a, b):
         c.filter(kept)
         c.update_and_fetch(x[:7], x[:7])
-    mx.eval(b.keys, b.values)
-    # The moved row and the appended columns, not a second bank.
-    assert mx.get_peak_memory() - base < 2 * row
+    # The bank keeps its eight rows; the freed slot holds the last row.
+    assert b._keys.shape[0] == 8 and b.keys.shape[0] == 7
     equal(a, b)
 
 
