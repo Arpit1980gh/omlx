@@ -1481,7 +1481,11 @@ async def _apply_cache_settings_runtime(
     )
 
     # Update scheduler config based on cache settings
-    if enabled is False or (enabled is None and not global_settings.cache.enabled):
+    if (
+        enabled is False
+        or (enabled is None and not global_settings.cache.enabled)
+        or global_settings.cache.is_ssd_cache_dir_unavailable()
+    ):
         pool._scheduler_config.paged_ssd_cache_dir = None
         pool._scheduler_config.paged_ssd_cache_max_size = 0
     else:
@@ -1494,7 +1498,7 @@ async def _apply_cache_settings_runtime(
             cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
         )
         pool._scheduler_config.paged_ssd_cache_auto_size = (
-            cache_cfg.is_ssd_cache_auto_size()
+            cache_cfg.ssd_cache_max_size.lower() == "auto"
         )
 
     # Apply hot cache max size
@@ -4647,6 +4651,9 @@ def _global_settings_response(global_settings):
         "cache": {
             "enabled": global_settings.cache.enabled,
             "ssd_cache_dir": cache_dir,
+            "ssd_cache_unavailable": (
+                global_settings.cache.is_ssd_cache_dir_unavailable()
+            ),
             "ssd_cache_max_size": global_settings.cache.ssd_cache_max_size,
             "ssd_cache_auto_size_bytes": get_auto_ssd_cache_size(Path(cache_dir)),
             "hot_cache_only": global_settings.cache.hot_cache_only,
@@ -5298,14 +5305,14 @@ async def update_global_settings(
             global_settings.cache.enabled = request.cache_enabled
             cache_changed = True
     if request.ssd_cache_dir is not None:
-        # Compare against the configured dir, not the fallback dir in use.
-        requested_cache_dir, configured_cache_dir = (
-            Path(value).expanduser().resolve()
-            if value
+        requested_cache_dir = (
+            Path(request.ssd_cache_dir).expanduser().resolve()
+            if request.ssd_cache_dir
             else (global_settings.base_path / "cache").resolve()
-            for value in (request.ssd_cache_dir, global_settings.cache.ssd_cache_dir)
         )
-        if requested_cache_dir != configured_cache_dir:
+        if requested_cache_dir != global_settings.cache.get_ssd_cache_dir(
+            global_settings.base_path
+        ).resolve():
             global_settings.cache.ssd_cache_dir = request.ssd_cache_dir
             cache_changed = True
     if request.ssd_cache_max_size is not None:
@@ -6459,10 +6466,11 @@ def _build_runtime_cache_observability(
     cache_cfg = global_settings.cache
     engine_pool = _get_engine_pool()
     auto_size = cache_cfg.ssd_cache_max_size.lower() == "auto"
+    ssd_cache_unavailable = cache_cfg.is_ssd_cache_dir_unavailable()
     try:
         cfg_disk_max = (
             0
-            if auto_size and engine_pool is not None
+            if ssd_cache_unavailable or (auto_size and engine_pool is not None)
             else cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
         )
     except (ValueError, OSError, TypeError) as exc:
@@ -6472,7 +6480,10 @@ def _build_runtime_cache_observability(
     payload = {
         "base_path": str(global_settings.base_path),
         "ssd_cache_dir": str(cache_dir),
-        "response_state_dir": str(cache_dir / "response-state"),
+        "ssd_cache_unavailable": ssd_cache_unavailable,
+        "response_state_dir": (
+            "" if ssd_cache_unavailable else str(cache_dir / "response-state")
+        ),
         "models": [],
         "total_num_files": 0,
         "total_size_bytes": 0,
@@ -6744,7 +6755,12 @@ def _build_runtime_cache_observability(
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total
     payload["hot_cache_entries"] = hot_cache_entries_total
-    if auto_size and not payload["models"] and engine_pool is not None:
+    if (
+        auto_size
+        and not payload["models"]
+        and engine_pool is not None
+        and not ssd_cache_unavailable
+    ):
         try:
             disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
         except (ValueError, OSError, TypeError) as exc:

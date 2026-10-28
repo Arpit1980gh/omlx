@@ -2512,7 +2512,8 @@ def init_server(
     if _server_state.distributed_inference_enabled:
         _register_cluster_routes()
     response_state_dir = None
-    if global_settings:
+    # Keep Responses state in memory while the SSD cache dir is unavailable.
+    if global_settings and not global_settings.cache.is_ssd_cache_dir_unavailable():
         response_state_dir = (
             global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
             / "response-state"

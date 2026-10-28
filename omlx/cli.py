@@ -373,24 +373,12 @@ def serve_command(args):
             print(f"MCP config: {mcp_config}")
             os.environ["OMLX_MCP_CONFIG"] = mcp_config
 
-        # Determine paged SSD cache directory
-        # Priority: --no-cache > CLI arg > settings file
-        if args.no_cache:
-            paged_ssd_cache_dir = None
-        elif settings.cache.enabled:
-            # Settings already include the CLI args, and this resolves to the
-            # fallback dir while the configured one is unavailable.
-            paged_ssd_cache_dir = str(
-                settings.cache.get_ssd_cache_dir(settings.base_path)
-            )
-        else:
-            # Cache explicitly disabled in settings
-            paged_ssd_cache_dir = None
-
-        # Build scheduler config for BatchedEngine
+        # Build scheduler config for BatchedEngine. Settings already include
+        # the CLI args and leave the SSD cache dir unset when it is off.
         scheduler_config = settings.to_scheduler_config()
-        # Set paged SSD cache options
-        scheduler_config.paged_ssd_cache_dir = paged_ssd_cache_dir
+        if args.no_cache:
+            scheduler_config.paged_ssd_cache_dir = None
+        paged_ssd_cache_dir = scheduler_config.paged_ssd_cache_dir
         if paged_ssd_cache_dir:
             cache_max_size_bytes = scheduler_config.paged_ssd_cache_max_size
         else:
@@ -432,6 +420,11 @@ def serve_command(args):
                 print(f"Hot cache: {hot_display} (in-memory)")
         else:
             print("Mode: Multi-model serving (continuous batching, no cache)")
+            if settings.cache.is_ssd_cache_dir_unavailable():
+                print(
+                    "paged SSD cache: off until restart, directory unavailable: "
+                    f"{settings.cache.unavailable_ssd_cache_dir}"
+                )
 
         # Set MLX buffer cache limit high to prevent the allocator from
         # immediately releasing Metal buffers when the cache is full.

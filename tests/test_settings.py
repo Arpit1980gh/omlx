@@ -1518,28 +1518,21 @@ class TestGlobalSettings:
             assert custom_logs.exists()
 
     def test_ensure_directories_unavailable_ssd_cache_dir(self, tmp_path):
-        """An unavailable cache dir falls back to the default dir with auto size."""
+        """An unavailable cache dir turns the SSD cache off without a fallback dir."""
         not_a_dir = tmp_path / "not-a-dir"
         not_a_dir.write_text("")
         configured = not_a_dir / "cache"
-        fallback = tmp_path / "omlx" / "cache"
         settings = GlobalSettings(base_path=tmp_path / "omlx")
         settings.cache.ssd_cache_dir = str(configured)
         settings.cache.ssd_cache_max_size = "180GB"
 
         settings.ensure_directories()
-        settings.ensure_directories()  # e.g. save() keeps the fallback
+        settings.ensure_directories()  # e.g. save() keeps the SSD cache off
 
-        assert fallback.is_dir()
+        assert not (tmp_path / "omlx" / "cache").exists()
         assert settings.cache.to_dict()["ssd_cache_dir"] == str(configured)
-        with patch(
-            "omlx.settings.get_auto_ssd_cache_size", return_value=1234
-        ) as auto_size:
-            config = settings.to_scheduler_config()
-        assert config.paged_ssd_cache_dir == str(fallback)
-        assert config.paged_ssd_cache_max_size == 1234
-        assert config.paged_ssd_cache_auto_size is True
-        auto_size.assert_called_once_with(fallback)
+        assert settings.cache.is_ssd_cache_dir_unavailable()
+        assert settings.to_scheduler_config().paged_ssd_cache_dir is None
 
         # A newly configured dir is used as is.
         settings.cache.ssd_cache_dir = str(tmp_path / "other")

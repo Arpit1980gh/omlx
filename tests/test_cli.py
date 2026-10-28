@@ -1167,6 +1167,7 @@ class TestServeCommandFunctions:
             enabled=False,
             ane_compile_cache=False,
             get_ssd_cache_dir=lambda base_path: tmp_path / "cache",
+            is_ssd_cache_dir_unavailable=lambda: False,
             get_ssd_cache_max_size_bytes=lambda base_path: 0,
             get_hot_cache_max_size_bytes=lambda: 0,
         )

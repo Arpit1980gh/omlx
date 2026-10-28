@@ -768,8 +768,9 @@
                                     </button>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                    <div class="flex items-center gap-2">
+                                    <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.cache.ssd_directory') }}</label>
+                                        <p x-show="globalSettings.cache.ssd_cache_unavailable" x-cloak class="text-xs text-amber-700 mt-1">{{ t('settings.cache.ssd_directory_unavailable') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.cache.ssd_cache_dir"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">

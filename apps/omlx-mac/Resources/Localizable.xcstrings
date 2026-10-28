@@ -11733,6 +11733,30 @@
         }
       }
     },
+    "performance.cache.ssd_dir.unavailable" : {
+      "comment" : "Warning under the SSD cache directory when it was unavailable at server start",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Not available when the server started. SSD cache is off until the server restarts."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Был недоступен при запуске сервера. SSD-кэш отключён до перезапуска сервера."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务器启动时不可用。在服务器重启之前，SSD 缓存保持关闭。"
+          }
+        }
+      }
+    },
     "performance.cache.ssd_size" : {
       "comment" : "Row label for the SSD cache size field",
       "extractionState" : "manual",
@@ -27831,6 +27855,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "位置"
+          }
+        }
+      }
+    },
+    "status.runtime_cache.location.unavailable" : {
+      "comment" : "Warning under the SSD cache location when it was unavailable at server start",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD cache is off because this directory was not available when the server started. Restart the server after reconnecting the drive."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD-кэш отключён, потому что этот каталог был недоступен при запуске сервера. Перезапустите сервер после повторного подключения диска."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务器启动时此目录不可用，因此 SSD 缓存已关闭。请重新连接驱动器后重启服务器。"
           }
         }
       }

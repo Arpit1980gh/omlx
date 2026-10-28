@@ -1355,7 +1355,7 @@ def test_gdn_storage_alias_only_rebuilds_on_policy_change(alias, split):
         assert gs.cache.gdn_ssd_split_enabled is split
 
 
-def test_unavailable_ssd_cache_dir_keeps_fallback_on_save(tmp_path):
+def test_unavailable_ssd_cache_dir_stays_off_on_save(tmp_path):
     not_a_dir = tmp_path / "not-a-dir"
     not_a_dir.write_text("")
     gs = GlobalSettings(base_path=tmp_path / "omlx")
@@ -1379,15 +1379,9 @@ def test_unavailable_ssd_cache_dir_keeps_fallback_on_save(tmp_path):
     apply_cache.assert_not_awaited()
 
     pool = MagicMock()
-    pool._scheduler_config = SchedulerConfig()
+    pool._scheduler_config = SchedulerConfig(paged_ssd_cache_dir="/tmp/cache")
     pool.get_loaded_model_ids.return_value = []
-    with (
-        patch.object(_server_state, "engine_pool", pool),
-        patch("omlx.settings.get_auto_ssd_cache_size", return_value=1234),
-    ):
+    with patch.object(_server_state, "engine_pool", pool):
         asyncio.run(admin_routes._apply_cache_settings_runtime(None, gs))
-    assert pool._scheduler_config.paged_ssd_cache_dir == str(
-        tmp_path / "omlx" / "cache"
-    )
-    assert pool._scheduler_config.paged_ssd_cache_max_size == 1234
-    assert pool._scheduler_config.paged_ssd_cache_auto_size is True
+    assert pool._scheduler_config.paged_ssd_cache_dir is None
+    assert pool._scheduler_config.paged_ssd_cache_max_size == 0

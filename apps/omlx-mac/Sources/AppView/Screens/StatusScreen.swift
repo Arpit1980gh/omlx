@@ -246,7 +246,12 @@ private struct RuntimeCacheSection: View {
             if let dir = cache?.ssdCacheDir, !dir.isEmpty {
                 Row(label: String(localized: "status.runtime_cache.location",
                                   defaultValue: "Location",
-                                  comment: "Row label for the SSD cache directory path")) {
+                                  comment: "Row label for the SSD cache directory path"),
+                    warning: cache?.ssdCacheUnavailable == true
+                        ? String(localized: "status.runtime_cache.location.unavailable",
+                                 defaultValue: "SSD cache is off because this directory was not available when the server started. Restart the server after reconnecting the drive.",
+                                 comment: "Warning under the SSD cache location when it was unavailable at server start")
+                        : nil) {
                     Text(dir)
                         .font(.omlxMono(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
