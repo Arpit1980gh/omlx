@@ -281,6 +281,12 @@ def mock_engine_pool():
     return pool
 
 
+@pytest.fixture(autouse=True)
+def _empty_image_decode_cache():
+    # Leftover images from other tests add a usage read to each pressure tick.
+    images.clear_image_decode_cache()
+
+
 @pytest.fixture
 def enforcer(mock_engine_pool):
     """Create an enforcer with a fixed 10GB ceiling.
@@ -3364,7 +3370,6 @@ class TestPressureReclaimGrace:
 async def test_image_cache_reclaimed_before_model_eviction(
     mock_engine_pool, initial_usage
 ):
-    images.clear_image_decode_cache()
     buffer = io.BytesIO()
     Image.new("RGB", (120, 120), "red").save(buffer, format="PNG")
     source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
@@ -3391,7 +3396,6 @@ async def test_image_cache_reclaimed_before_model_eviction(
 
 
 async def test_image_cache_reclaim_remeasures_retained_request_memory(mock_engine_pool):
-    images.clear_image_decode_cache()
     buffer = io.BytesIO()
     Image.new("RGB", (120, 120), "blue").save(buffer, format="PNG")
     source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
