@@ -1010,8 +1010,10 @@ class BatchQSAKVCache:
         return self.kv_cache.make_mask(*args, **kwargs)
 
     def filter(self, batch_indices):
-        min_left = int(self.left_padding[batch_indices].min().item())
+        width_before = self.kv_cache._idx
         self.kv_cache.filter(batch_indices)
+        # The KV bank drops the common left padding only when it compacts.
+        min_left = width_before - self.kv_cache._idx
         if self.index_keys is None:
             return
         kept = (
