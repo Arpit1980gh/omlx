@@ -300,7 +300,9 @@ def geometry(n: int, rt: int) -> tuple[int, int]:
         return 4, 4
     if n >= 4096:
         return 4, 8
-    return 4, 16
+    # Small N: two tiles keep the 4 x 16 simdgroup count in 256 threads; the
+    # 5-bit bf16 pipeline admits only 448 threads on M1 and M2.
+    return 2, 8
 
 
 @cache

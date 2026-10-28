@@ -129,7 +129,7 @@ def mma_on(monkeypatch):
 @pytest.mark.parametrize("n", [1024, 4096])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_mma_matches_fp32_reference(mma_on, bits, rows, n, dtype):
-    k = 2048
+    k = 5120  # Qwen3.8-27B hidden size; the thread limit varies with K
     mx.random.seed(rows + n)
     w, scales, biases = mx.quantize(
         (mx.random.normal((n, k)) * 0.05).astype(dtype), group_size=64, bits=bits
