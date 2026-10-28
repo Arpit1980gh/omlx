@@ -14,6 +14,7 @@ from omlx.cache.type_handlers import KVCacheHandler
 from omlx.patches.mlx_vlm_qwen4_exp_compat import (
     apply_mlx_vlm_qwen4_exp_compat_patch,
 )
+from omlx.patches.vlm_batch_kv_capacity import _refill_order
 
 apply_mlx_vlm_qwen4_exp_compat_patch()
 
@@ -62,6 +63,8 @@ def equal(a, b):
     assert a._idx == b._idx
     if a.keys is None:
         return
+    # A refill keeps spare rows only while live rows fill over half the bank.
+    assert b._keys.shape[0] < 2 * b.keys.shape[0]
     assert b._logical_width() == a.keys.shape[2]
     assert mx.array_equal(a.keys, b.keys[..., : b._logical_width(), :]).item()
     assert mx.array_equal(a.values, b.values[..., : b._logical_width(), :]).item()
@@ -96,7 +99,16 @@ def test_cache_and_attention_match_stock_through_lifecycle(seed, backend):
     equal(a, b)
     for step in range(40):
         operation = rng.choice(
-            ["append", "merge", "trim", "rollback", "filter", "extend", "restore"]
+            [
+                "append",
+                "merge",
+                "trim",
+                "rollback",
+                "filter",
+                "finish",
+                "extend",
+                "restore",
+            ]
         )
         if operation in ("append", "rollback"):
             n = rng.randint(1, 17)
@@ -118,6 +130,12 @@ def test_cache_and_attention_match_stock_through_lifecycle(seed, backend):
             )
         elif operation == "filter":
             kept = rng.sample(range(a.keys.shape[0]), rng.randint(1, a.keys.shape[0]))
+            a.filter(kept)
+            b.filter(kept)
+        elif operation == "finish":
+            # The row order GenerationBatch.filter passes after rows finish.
+            rows = a.keys.shape[0]
+            kept = _refill_order(sorted(rng.sample(range(rows), rng.randint(1, rows))))
             a.filter(kept)
             b.filter(kept)
         elif operation == "extend" and a.keys.shape[0] < 6:
@@ -152,6 +170,36 @@ def test_merge_reserves_append_without_changing_logical_width(backend):
         assert row.keys.shape[2] > row.offset
     else:
         assert row.keys.shape[2] == row.offset
+
+
+def test_finished_row_is_refilled_without_copying_the_bank(backend):
+    stock, patched = backend
+    lengths = [4000, 3990, 3999, 3000, 3998, 3997, 3996, 3995]
+    a, b = make(stock, lengths), make(patched, lengths)
+    x = mx.ones((8, 2, 3, 8), mx.bfloat16)
+    kept = _refill_order([0, 1, 2, 4, 5, 6, 7])
+    for c in (a, b):
+        c.update_and_fetch(x, x)
+        c.filter(kept)
+        c.update_and_fetch(x[:7], x[:7])
+    # The bank keeps its eight rows; the freed slot holds the last row.
+    assert b._keys.shape[0] == 8 and b.keys.shape[0] == 7
+    equal(a, b)
+
+
+def test_setting_keys_alone_after_a_refill_keeps_rows_aligned(backend):
+    stock, patched = backend
+    a, b = make(stock, [40, 39, 38, 37]), make(patched, [40, 39, 38, 37])
+    x = mx.ones((3, 2, 2, 8), mx.bfloat16)
+    for c in (a, b):
+        c.filter(_refill_order([0, 1, 3]))
+        c.keys = mx.depends(c.keys, c.values)
+        c.update_and_fetch(x, x)
+    # The plain set adopts the capacity width, so only the live columns compare.
+    assert a._idx == b._idx
+    assert b.keys.shape[0] == b.values.shape[0] == 3
+    for x, y in ((a.keys, b.keys), (a.values, b.values)):
+        assert mx.array_equal(x[..., : a._idx, :], y[..., : b._idx, :]).item()
 
 
 def test_prefix_handler_restore_uses_capacity_managed_cache():

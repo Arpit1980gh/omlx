@@ -4108,6 +4108,57 @@ def test_clip_block_drafts_keeps_aligned_proposal_prefix():
     assert state.drafts.tolist() == [1]
 
 
+def test_clip_to_shared_window_aligns_rows_that_verify():
+    def row(length, *, copy=False, queued=False):
+        state = bg._MtpState(uid=length, chain=True)
+        state.drafts = mx.arange(length, dtype=mx.uint32)
+        if copy:
+            ids = mx.arange(length * 2, dtype=mx.int32).reshape(length, 2)
+            state.draft_accept_lps = bg.SparseDraftQ(ids, mx.zeros((length, 2)), 64)
+            state.copy_drafts = True
+        if queued:
+            state.queue.append((0, None, "draft"))
+        return state
+
+    head, copied, waiting = row(3), row(7, copy=True), row(5, queued=True)
+    bg._clip_to_shared_window([head, copied, waiting])
+    assert copied.drafts.tolist() == [0, 1, 2]
+    assert copied.draft_accept_lps.ids.shape[0] == 3
+    assert head.drafts.tolist() == [0, 1, 2]
+    assert waiting.drafts.shape[0] == 5
+
+
+def test_initial_batch_forward_keeps_model_owned_sampled_rows_in_place(monkeypatch):
+    class ModelOwnedCache:
+        _omlx_mtp_batch_rollback_cache = True
+        offset = mx.array([5, 7])
+
+    calls = []
+
+    def backbone(model, inputs, cache, **kwargs):
+        calls.append(tuple(inputs.shape))
+        return "logits", "hidden", None, None
+
+    monkeypatch.setattr(bg, "_resolve_mtp_chain_depth", lambda model: (True, 3, False))
+    monkeypatch.setattr(bg, "_set_batched_mrope_deltas", lambda *args: None)
+    monkeypatch.setattr(bg, "_call_backbone_captured", backbone)
+    batch = SimpleNamespace(
+        model=SimpleNamespace(
+            _language_model=SimpleNamespace(_omlx_mtp_batch_rollback=True)
+        ),
+        uids=[1, 2],
+        _next_tokens=mx.array([4, 9]),
+        prompt_cache=[ModelOwnedCache()],
+        samplers=[lambda lp: mx.random.categorical(lp)] * 2,
+        logits_processors=None,
+    )
+    assert bg._initial_batch_forward(batch) == ("logits", "hidden", [6, 8], None)
+    assert calls == [(2, 1)]
+
+    batch.logits_processors = [None, [lambda tokens, logits: logits]]
+    assert bg._initial_batch_forward(batch) is None
+
+
 @pytest.mark.parametrize("unequal_acceptance", [False, True])
 def test_active_batch_admits_new_row_without_rebuilding_old_rows(
     monkeypatch, unequal_acceptance
