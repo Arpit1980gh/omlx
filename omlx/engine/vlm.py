@@ -2865,6 +2865,7 @@ class VLMBatchedEngine(BaseEngine):
         # and examples, so upstream inference incorrectly selects json_tools.
         # Use the same oMLX protocol adapter as distributed ranks.
         from ..adapter.output_parser import (
+            correct_tool_parser_type,
             install_minimax_m3_tokenizer_protocol,
         )
 
@@ -2883,7 +2884,9 @@ class VLMBatchedEngine(BaseEngine):
                 load_tool_module,
             )
 
-            tool_parser_type = _infer_tool_parser(chat_template)
+            tool_parser_type = correct_tool_parser_type(
+                _infer_tool_parser(chat_template), chat_template
+            )
             if tool_parser_type is None:
                 return
             try:

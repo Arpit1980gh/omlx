@@ -788,6 +788,18 @@ class TestInjectToolCalling:
         assert tokenizer.has_tool_calling is True
         assert tokenizer.tool_call_start == "<tool_call>"
 
+    def test_mimo_template_uses_qwen3_coder(self):
+        """MiMo writes <tool_call><function= with no newline (#4933)."""
+        engine = _make_engine()
+        tokenizer = MockVLMTokenizer(
+            chat_template="'<tool_call><function=' ~ tool_call.name ~ '>'",
+            vocab={"<tool_call>": 100, "</tool_call>": 101},
+        )
+
+        engine._inject_tool_calling(tokenizer)
+
+        assert tokenizer.tool_parser.__module__ == "mlx_vlm.tools.parsers.qwen3_coder"
+
     def test_skips_when_no_chat_template(self):
         """No chat template → no injection."""
         engine = _make_engine()
