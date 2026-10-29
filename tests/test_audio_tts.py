@@ -8,10 +8,14 @@ All unit tests run with mocked TTSEngine and EnginePool — mlx-audio is not
 required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
+import asyncio
 import base64
 import io
 import struct
+import threading
 import wave
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import mlx.core as mx
@@ -778,6 +782,35 @@ class TestTTSLFM3Speech:
         mock_pool.get_engine.return_value = engine
         response = client.post("/v1/audio/speech", json={"model": "vl", "input": "Hi"})
         assert response.status_code == 400
+
+    def test_speech_runs_on_engine_executor_and_keeps_engine_active(self):
+        from omlx.engine.lfm3_speech import LFM3Speech
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        engine = VLMBatchedEngine(model_name="lfm3-audio")
+        executor = ThreadPoolExecutor(1, thread_name_prefix="mlx-engine-test")
+        engine._engine = SimpleNamespace(_mlx_executor=executor, engine=None)
+        speech = LFM3Speech(engine)
+        seen = {}
+
+        def run(*args, **kwargs):
+            seen["thread"] = threading.current_thread().name
+            seen["active"] = engine.has_active_requests()
+            return SimpleNamespace(text="hi", prompt_tokens=1, generation_tokens=1)
+
+        try:
+            with patch.object(LFM3Speech, "_run", side_effect=run):
+                asyncio.run(speech.transcribe("clip.wav"))
+            assert seen["thread"].startswith("mlx-engine-test")
+            assert seen["active"] is True
+            assert engine.has_active_requests() is False
+
+            with patch.object(LFM3Speech, "_run", side_effect=RuntimeError("boom")):
+                with pytest.raises(RuntimeError, match="boom"):
+                    asyncio.run(speech.transcribe("clip.wav"))
+            assert engine.has_active_requests() is False
+        finally:
+            executor.shutdown()
 
     def test_tts_prompt_names_the_locale_and_voice(self):
         from omlx.engine.lfm3_speech import tts_prompt

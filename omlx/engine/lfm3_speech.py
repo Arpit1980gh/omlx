@@ -5,8 +5,8 @@ Speech tasks for LFM3-Audio and LFM3-Omni on the VLM engine's loaded model.
 The model card selects each task with a system prompt: ASR serves
 /v1/audio/transcriptions, TTS serves /v1/audio/speech and a spoken reply
 serves /v1/audio/process. Chat requests keep the batched VLM path. Each task
-runs mlx-vlm's single-prompt speech loop in one MLX executor call, as the
-mlx-audio engines do.
+runs mlx-vlm's single-prompt speech loop in one call on the engine's own MLX
+executor, between scheduler steps.
 """
 
 import asyncio
@@ -19,7 +19,6 @@ import numpy as np
 from mlx_vlm.generate.audio import generate_audio
 from mlx_vlm.prompt_utils import apply_chat_template
 
-from ..engine_core import get_mlx_executor
 from .audio_utils import audio_to_wav_bytes
 
 if TYPE_CHECKING:
@@ -124,11 +123,19 @@ class LFM3Speech:
         )
 
     async def _generate(self, kind: str, *args: Any, **kwargs: Any):
+        engine_core = self._engine._engine
+        if engine_core is None:
+            raise RuntimeError("Engine not started. Call start() first.")
         start = time.monotonic()
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            get_mlx_executor(), lambda: self._run(*args, **kwargs)
-        )
+        # Keeps the pool from evicting the model while the speech loop runs.
+        self._engine._speech_active += 1
+        try:
+            result = await loop.run_in_executor(
+                engine_core._mlx_executor, lambda: self._run(*args, **kwargs)
+            )
+        finally:
+            self._engine._speech_active -= 1
         logger.info(
             "LFM3 %s: model=%s, %d prompt tokens, %d slots, %.2fs",
             kind,
