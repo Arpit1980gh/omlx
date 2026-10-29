@@ -5963,7 +5963,7 @@ class VLMBatchedEngine(BaseEngine):
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""
-        if self._speech_active:
+        if getattr(self, "_speech_active", 0):
             return True
         if self.is_diffusion_model:
             return getattr(self, "_diffusion_active_requests", 0) > 0
