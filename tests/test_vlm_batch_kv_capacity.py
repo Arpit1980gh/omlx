@@ -195,11 +195,36 @@ def test_setting_keys_alone_after_a_refill_keeps_rows_aligned(backend):
         c.filter(_refill_order([0, 1, 3]))
         c.keys = mx.depends(c.keys, c.values)
         c.update_and_fetch(x, x)
-    # The plain set adopts the capacity width, so only the live columns compare.
-    assert a._idx == b._idx
     assert b.keys.shape[0] == b.values.shape[0] == 3
-    for x, y in ((a.keys, b.keys), (a.values, b.values)):
-        assert mx.array_equal(x[..., : a._idx, :], y[..., : b._idx, :]).item()
+    equal(a, b)
+
+
+def test_join_fills_a_freed_row_and_shifts_live_rows_in_place(backend):
+    stock, patched = backend
+    lengths = [300, 290, 299, 200]
+    a, b = make(stock, lengths), make(patched, lengths)
+    # A row shorter than the batch, then one longer that moves the live rows right.
+    for joined in (120, 700):
+        for c in (a, b):
+            c.filter(_refill_order([0, 1, 2]))
+        bank = b._keys
+        a.extend(make(stock, [joined]))
+        b.extend(make(patched, [joined]))
+        assert b._keys is bank
+        equal(a, b)
+    assert b._idx == 700
+
+
+def test_setting_the_bank_back_keeps_its_logical_width(backend):
+    stock, patched = backend
+    a, b = make(stock, [300, 290, 280]), make(patched, [300, 290, 280])
+    # DSA indexers and MTP heads write the bank back through mx.depends each step.
+    for _ in range(3):
+        for c, module in ((a, stock), (b, patched)):
+            c.keys = mx.depends(c.keys, c.values)
+            c.extend(make(module, [100]))
+            c.filter([0, 1, 2])
+        equal(a, b)
 
 
 def test_prefix_handler_restore_uses_capacity_managed_cache():
