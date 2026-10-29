@@ -46,6 +46,7 @@ from ..api.utils import (
     detect_and_strip_partial,
     remove_special_tokens_preserve_whitespace,
 )
+from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
@@ -107,6 +108,8 @@ OCR_MODEL_PROMPTS: Dict[str, str] = {
     "dots_ocr": "Convert this page to clean Markdown while preserving reading order.",
     "glm_ocr": "Text Recognition:",
 }
+# Unlimited-OCR-2 (DASH decoder) defaults to this prompt for any page count.
+UNLIMITED_OCR_2_PROMPT = "Multi page parsing."
 
 # Extra stop sequences for OCR models to prevent degeneration.
 # Many OCR models lack proper EOS handling and generate chat-turn
@@ -2333,6 +2336,7 @@ class VLMBatchedEngine(BaseEngine):
                 # Agent sessions resend 20-90 screenshots; bound by bytes.
                 max_memory_entries=4096,
                 max_memory_bytes=1024**3,
+                numerics=numerics_revision_for_model(self._vlm_model),
             )
             logger.info(
                 "Vision feature cache enabled (SSD: %s)",
@@ -4132,6 +4136,10 @@ class VLMBatchedEngine(BaseEngine):
                     "model repository.",
                     field="messages",
                 )
+            # The Unlimited-OCR processor reads a prompt list as a batch with
+            # one image per prompt. A single prompt string keeps every page.
+            if model_type == "unlimited-ocr" and isinstance(prompt, str):
+                prompts = prompt
             # Tokenize text and preprocess images and audio
             inputs = prepare_inputs(
                 self._processor,
@@ -5280,6 +5288,17 @@ class VLMBatchedEngine(BaseEngine):
         ):
             yield output
 
+    def _is_unlimited_ocr_2(self) -> bool:
+        """True for Unlimited-OCR-2, whose decoder uses DASH sparse attention."""
+        config = getattr(self._vlm_model, "config", None)
+        text_config = getattr(config, "text_config", None)
+        sparse = getattr(text_config, "sparse_attention_config", None)
+        return (
+            self.model_type == "unlimited-ocr"
+            and isinstance(sparse, dict)
+            and sparse.get("training_stage") == "dash"
+        )
+
     def _apply_ocr_prompt(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Apply a default OCR prompt only when the user sends no text.
 
@@ -5299,6 +5318,8 @@ class VLMBatchedEngine(BaseEngine):
             return messages
 
         ocr_prompt = OCR_MODEL_PROMPTS[model_type]
+        if self._is_unlimited_ocr_2():
+            ocr_prompt = UNLIMITED_OCR_2_PROMPT
         messages = copy.deepcopy(messages)
 
         # Find last user message
